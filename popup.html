@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ChatGPT Flow</title>
+    <link rel="stylesheet" href="popup.css" />
+</head>
+
+<body>
+    <main class="popup">
+        <div class="title-row">
+            <div>
+                <h1>ChatGPT Flow</h1>
+                <p>Hands-free dictation and automatic read aloud.</p>
+            </div>
+
+            <label class="switch" aria-label="Enable ChatGPT Flow">
+                <input id="enabled" type="checkbox" />
+                <span class="slider"></span>
+            </label>
+        </div>
+
+        <div class="details">
+            <div><strong>Silence:</strong> 5 seconds</div>
+            <div><strong>Read aloud:</strong> 1 second after reply finishes</div>
+        </div>
+
+        <div id="status" class="status">Enabled</div>
+    </main>
+
+    <script src="popup.js"></script>
+</body>
+
+</html>
