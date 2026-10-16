@@ -1,8 +1,8 @@
 (() => {
   "use strict";
 
-  if (window.__CHATGPT_FLOW_V039__) return;
-  window.__CHATGPT_FLOW_V039__ = true;
+  if (window.__CHATGPT_FLOW_V046__) return;
+  window.__CHATGPT_FLOW_V046__ = true;
 
   const DEFAULT_SILENCE_MS = 5000;
   const MIN_SILENCE_MS = 2000;
@@ -20,6 +20,7 @@
   const DEFAULT_PLAYBACK_RATE = 1;
   const MIN_PLAYBACK_RATE = 0.5;
   const MAX_PLAYBACK_RATE = 2;
+  const FLOW_PAUSE_PIN_MS = 40;
 
   const READ_SELECTOR = 'button[aria-label="Read aloud"]';
   const TRANSCRIBE_SEND_SELECTOR = 'button[aria-label="Transcribe and send"]';
@@ -61,9 +62,15 @@
   let readAudioStartTimer = 0;
   let activeReadAudio = null;
   let playbackControls = null;
+  let playbackControlsHost = null;
   let activeReadButton = null;
+  let activeReadTurn = null;
+  let playbackPortalOffset = null;
+  let playbackPortalRect = null;
   let flowReadPaused = false;
   let flowPausePosition = 0;
+  let flowPauseTimer = 0;
+  let flowPauseOriginalMuted = false;
   let awaitingNativeReadAudio = false;
   let controlChannel = null;
   let nativeMediaPlay = null;
@@ -536,43 +543,130 @@
     return button;
   }
 
+  function rememberPlaybackPlacement(anchor, root) {
+    const turn = activeReadTurn || anchor?.closest?.("article") || null;
+
+    if (turn instanceof Element && turn.isConnected) {
+      activeReadTurn = turn;
+    }
+
+    // v0.4.6: the controls NEVER live inside ChatGPT's React tree. React was
+    // deleting our sibling whenever its Read aloud/Stop action rerendered.
+    // Remember the viewport position beside the native button and render the
+    // controls from document.body instead.
+    try {
+      const anchorRect = anchor?.getBoundingClientRect?.();
+      const rootRect = root?.getBoundingClientRect?.();
+
+      if (anchorRect && anchorRect.width > 0 && anchorRect.height > 0) {
+        playbackPortalRect = {
+          documentLeft: anchorRect.right + window.scrollX,
+          documentTop: anchorRect.top + window.scrollY,
+        };
+      } else if (rootRect && rootRect.width > 0 && rootRect.height > 0) {
+        playbackPortalRect = {
+          documentLeft: rootRect.left + window.scrollX,
+          documentTop: rootRect.top + window.scrollY,
+        };
+      }
+    } catch {}
+  }
+
+  function findReadPlaybackAnchorInTurn(turn) {
+    if (!(turn instanceof Element) || !turn.isConnected) return null;
+
+    const read = [...turn.querySelectorAll(READ_SELECTOR)].filter(isUsableButton).at(-1);
+    if (read) return read;
+
+    const stop = [...turn.querySelectorAll("button")]
+      .filter(isUsableButton)
+      .filter((button) => !isStopGeneratingButton(button))
+      .filter((button) => !/dictation/i.test(buttonLabel(button)))
+      .find((button) =>
+        /^(?:stop|pause)(?:\s+(?:reading|read aloud|audio))?$/i.test(buttonLabel(button)),
+      );
+
+    return stop || null;
+  }
+
+  function renderPlaybackControlsInBody(root) {
+    if (!root || !playbackPortalRect) return false;
+
+    try {
+      if (root.parentElement !== document.body) {
+        document.body.appendChild(root);
+      }
+
+      Object.assign(root.style, {
+        position: "fixed",
+        left: `${Math.round(playbackPortalRect.documentLeft - window.scrollX)}px`,
+        top: `${Math.round(playbackPortalRect.documentTop - window.scrollY)}px`,
+        zIndex: "2147483000",
+        display: "inline-flex",
+        pointerEvents: "auto",
+      });
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function readPlaybackIsPinned() {
+    return !!(
+      activeReadAudio ||
+      awaitingNativeReadAudio ||
+      awaitingAutoReadAudio ||
+      flowReadPaused
+    );
+  }
+
   function resolvePlaybackAnchor() {
-    // UI-only v0.3.9: always follow the last visible native Read aloud button.
-    // This makes the three Flow buttons deterministic even before audio exists.
+    // First preference while a session is active: an action in the SAME turn.
+    // Never jump to an older answer.
+    if (readPlaybackIsPinned()) {
+      const inTurn = findReadPlaybackAnchorInTurn(activeReadTurn);
+      if (inTurn) return inTurn;
+      return isUsableButton(activeReadButton) ? activeReadButton : null;
+    }
+
     const latestVisible = [...document.querySelectorAll(READ_SELECTOR)]
       .filter(isUsableButton)
       .at(-1);
 
-    if (latestVisible) {
-      return latestVisible;
-    }
+    if (latestVisible) return latestVisible;
+
+    const nativeStop = findNativeReadStopButton();
+    if (isUsableButton(nativeStop)) return nativeStop;
 
     return isUsableButton(activeReadButton) ? activeReadButton : null;
   }
 
   function placePlaybackControls() {
     const controls = playbackControls;
+    if (!controls?.root) return false;
+
     const anchor = resolvePlaybackAnchor();
 
-    if (!controls?.root || !(anchor instanceof HTMLButtonElement)) {
-      return false;
+    if (anchor instanceof HTMLButtonElement) {
+      activeReadButton = anchor;
+      playbackControlsHost = anchor.parentElement || playbackControlsHost;
+
+      for (const button of [controls.back, controls.toggle, controls.forward, controls.speed]) {
+        stylePlaybackControlLikeChatGPT(button, anchor);
+      }
+
+      rememberPlaybackPlacement(anchor, controls.root);
     }
 
-    activeReadButton = anchor;
-
-    for (const button of [controls.back, controls.toggle, controls.forward]) {
-      stylePlaybackControlLikeChatGPT(button, anchor);
+    // Crucial invariant: once we know where the controls belong, keep them in
+    // document.body. ChatGPT can replace/remove its whole action row and our
+    // buttons survive because they are no longer descendants of that row.
+    if (renderPlaybackControlsInBody(controls.root)) {
+      return true;
     }
 
-    const parent = anchor.parentElement;
-
-    if (!parent) return false;
-
-    if (controls.root.parentElement !== parent || controls.root.previousElementSibling !== anchor) {
-      anchor.insertAdjacentElement("afterend", controls.root);
-    }
-
-    return true;
+    return controls.root.isConnected && isVisible(controls.root);
   }
 
   function ensurePlaybackControls() {
@@ -614,8 +708,21 @@
     });
     setPlaybackButtonIcon(forward, "forward");
 
-    root.append(back, toggle, forward);
-    playbackControls = { root, back, toggle, forward };
+    const speed = createPlaybackControl("Read aloud speed", () => {
+      cyclePlaybackRate();
+    });
+    speed.setAttribute("aria-label", "Read aloud speed");
+    speed.textContent = `${playbackRate}×`;
+    Object.assign(speed.style, {
+      fontSize: "11px",
+      fontWeight: "600",
+      lineHeight: "20px",
+      minWidth: "30px",
+      paddingInline: "4px",
+    });
+
+    root.append(back, toggle, forward, speed);
+    playbackControls = { root, back, toggle, forward, speed };
     placePlaybackControls();
 
     return playbackControls;
@@ -659,31 +766,65 @@
         : "Play / pause Read aloud";
 
     controls.toggle.setAttribute("aria-label", controls.toggle.title);
+
+    controls.speed.textContent = `${playbackRate}×`;
+    controls.speed.title = `Read aloud speed: ${playbackRate}×`;
+    controls.speed.setAttribute("aria-label", controls.speed.title);
   }
 
-  function clearFlowPauseState() {
+  function cyclePlaybackRate() {
+    const rates = [0.75, 1, 1.25, 1.5, 1.75, 2];
+    const currentIndex = rates.findIndex(
+      (rate) => Math.abs(rate - playbackRate) < 0.001,
+    );
+    playbackRate = rates[(currentIndex + 1 + rates.length) % rates.length];
+
+    const media = activeReadAudio;
+    if (media instanceof HTMLMediaElement && !media.ended && mediaHasSource(media)) {
+      try {
+        media.defaultPlaybackRate = playbackRate;
+        media.playbackRate = playbackRate;
+      } catch (error) {
+        log("Could not change Read aloud speed:", error);
+      }
+    }
+
+    sendPlaybackRateSetting();
+    updatePlaybackControls();
+    log("Read aloud speed", `${playbackRate}x`);
+  }
+
+  function clearFlowPauseTimer() {
+    if (!flowPauseTimer) return;
+    clearInterval(flowPauseTimer);
+    flowPauseTimer = 0;
+  }
+
+  function clearFlowPauseState({ restoreMuted = true } = {}) {
+    clearFlowPauseTimer();
+
+    const media = activeReadAudio;
+    if (restoreMuted && media instanceof HTMLMediaElement) {
+      try {
+        media.muted = flowPauseOriginalMuted;
+      } catch {}
+    }
+
     flowReadPaused = false;
     flowPausePosition = 0;
+    flowPauseOriginalMuted = false;
   }
 
-  function installManagedPauseEventShield(media) {
-    if (!(media instanceof HTMLMediaElement)) return;
+  function looksLikeChatGPTReadAudio(media) {
+    if (!(media instanceof HTMLAudioElement)) return false;
 
-    const blockPauseCleanup = (event) => {
-      if (!flowReadPaused || activeReadAudio !== media) return;
+    const src = String(media.currentSrc || media.src || "");
 
-      // ChatGPT tears down its detached blob-backed audio from its pause
-      // handler. Flow owns this particular pause, so hide only this one pause
-      // event from page listeners. A real Stop still uses an ordinary pause.
-      event.stopImmediatePropagation();
-      event.stopPropagation();
-      log("Suppressed ChatGPT pause cleanup for resumable Read aloud");
-    };
-
-    media.addEventListener("pause", blockPauseCleanup, {
-      capture: true,
-      once: true,
-    });
+    return (
+      !media.isConnected &&
+      (src.startsWith("blob:https://chatgpt.com/") ||
+        src.startsWith("blob:https://chat.openai.com/"))
+    );
   }
 
   function adoptReadAudio(media) {
@@ -697,15 +838,18 @@
     awaitingAutoReadAudio = false;
     awaitingNativeReadAudio = false;
 
-    if (!media.__chatgptFlowEndHookV039) {
+    if (!media.__chatgptFlowEndHookV046) {
       media.addEventListener(
         "ended",
         () => {
           if (activeReadAudio !== media) return;
 
-          clearFlowPauseState();
+          clearFlowPauseState({ restoreMuted: false });
           activeReadAudio = null;
           activeReadButton = null;
+          activeReadTurn = null;
+          playbackPortalOffset = null;
+          playbackPortalRect = null;
           updatePlaybackControls();
           releaseReadLock();
         },
@@ -713,7 +857,7 @@
       );
 
       try {
-        Object.defineProperty(media, "__chatgptFlowEndHookV039", {
+        Object.defineProperty(media, "__chatgptFlowEndHookV046", {
           value: true,
           configurable: true,
         });
@@ -726,10 +870,31 @@
     }
 
     try {
+      media.defaultPlaybackRate = playbackRate;
       media.playbackRate = playbackRate;
     } catch {}
 
     updatePlaybackControls();
+  }
+
+  function installManagedPauseEventShield(media) {
+    if (!(media instanceof HTMLMediaElement)) return;
+
+    const blockManagedPause = (event) => {
+      if (!flowReadPaused || activeReadAudio !== media) return;
+
+      // The detached ChatGPT TTS element is destroyed by page cleanup after
+      // its pause event. For Flow's resumable pause, hide ONLY this one pause
+      // event from page listeners. A real Stop remains completely native.
+      event.stopImmediatePropagation();
+      event.stopPropagation();
+      log("Suppressed ChatGPT pause cleanup for resumable Read aloud");
+    };
+
+    media.addEventListener("pause", blockManagedPause, {
+      capture: true,
+      once: true,
+    });
   }
 
   function beginFlowPause(media) {
@@ -749,39 +914,48 @@
     flowPausePosition = Number.isFinite(media.currentTime)
       ? media.currentTime
       : 0;
+    flowPauseOriginalMuted = !!media.muted;
     flowReadPaused = true;
 
-    installManagedPauseEventShield(media);
-
+    // IMPORTANT: never call pause() here. ChatGPT destroys its MediaSource
+    // about a second after a real pause. Keep the native stream alive, mute it,
+    // and pin currentTime to the saved position until the user resumes.
     try {
-      const pause = nativeMediaPause || HTMLMediaElement.prototype.pause;
-      pause.call(media);
+      media.muted = true;
       media.currentTime = flowPausePosition;
     } catch (error) {
       flowReadPaused = false;
-      log("Read aloud pause failed:", error);
+      log("Read aloud virtual pause failed:", error);
       return false;
     }
 
-    // If the page changed the source synchronously despite the pause-event
-    // shield, do not pretend the media is resumable.
-    queueMicrotask(() => {
-      if (activeReadAudio !== media || !flowReadPaused) return;
-
-      if (!mediaHasSource(media)) {
-        log("Read aloud source disappeared after pause");
-        clearFlowPauseState();
-        activeReadAudio = null;
-        activeReadButton = null;
+    clearFlowPauseTimer();
+    flowPauseTimer = window.setInterval(() => {
+      if (activeReadAudio !== media || !flowReadPaused) {
+        clearFlowPauseTimer();
+        return;
       }
 
-      updatePlaybackControls();
-    });
+      if (media.ended || !mediaHasSource(media)) {
+        clearFlowPauseState({ restoreMuted: false });
+        activeReadAudio = null;
+        updatePlaybackControls();
+        releaseReadLock();
+        return;
+      }
+
+      try {
+        media.muted = true;
+        if (Math.abs(media.currentTime - flowPausePosition) > 0.015) {
+          media.currentTime = flowPausePosition;
+        }
+      } catch (error) {
+        log("Read aloud pause pin failed:", error);
+      }
+    }, FLOW_PAUSE_PIN_MS);
 
     updatePlaybackControls();
-    releaseReadLock();
-
-    log("Read aloud paused at", flowPausePosition.toFixed(2));
+    log("Read aloud virtually paused at", flowPausePosition.toFixed(2));
     return true;
   }
 
@@ -793,42 +967,37 @@
       media.ended ||
       !mediaHasSource(media)
     ) {
-      clearFlowPauseState();
+      clearFlowPauseState({ restoreMuted: false });
       activeReadAudio = null;
-      activeReadButton = null;
       updatePlaybackControls();
       return false;
     }
 
-    broadcastPauseReadAloud();
-
-    const lockGranted = await acquireReadLock();
-
-    if (!lockGranted) {
-      log("Another ChatGPT tab is already reading; resume skipped");
-      return false;
-    }
-
     const resumeAt = flowPausePosition;
+    const restoreMuted = flowPauseOriginalMuted;
+
+    clearFlowPauseTimer();
 
     try {
       media.currentTime = resumeAt;
+      media.defaultPlaybackRate = playbackRate;
       media.playbackRate = playbackRate;
+      media.muted = restoreMuted;
       flowReadPaused = false;
+      flowPausePosition = 0;
+      flowPauseOriginalMuted = false;
 
-      const play = nativeMediaPlay || HTMLMediaElement.prototype.play;
-      const promise = play.call(media);
-
-      if (promise?.then) {
-        promise.then(
-          () => updatePlaybackControls(),
-          (error) => {
-            flowReadPaused = true;
+      // Normally the underlying media never stopped, so there is nothing to
+      // restart. If the browser paused it for an unrelated reason, restart it
+      // only while the original MediaSource is still alive.
+      if (media.paused && mediaHasSource(media)) {
+        const play = nativeMediaPlay || HTMLMediaElement.prototype.play;
+        const promise = play.call(media);
+        if (promise?.catch) {
+          promise.catch((error) => {
             log("Read aloud resume play() failed:", error);
-            releaseReadLock();
-            updatePlaybackControls();
-          },
-        );
+          });
+        }
       }
 
       updatePlaybackControls();
@@ -836,7 +1005,11 @@
       return true;
     } catch (error) {
       flowReadPaused = true;
-      releaseReadLock();
+      flowPausePosition = resumeAt;
+      flowPauseOriginalMuted = restoreMuted;
+      try {
+        media.muted = true;
+      } catch {}
       updatePlaybackControls();
       throw error;
     }
@@ -845,7 +1018,15 @@
   async function toggleManagedReadAloud() {
     const media = activeReadAudio;
 
-    if (!(media instanceof HTMLMediaElement) || media.ended) {
+    if (!(media instanceof HTMLMediaElement) || media.ended || !mediaHasSource(media)) {
+      // If there is no active media yet, make the center Play button useful:
+      // start the latest native Read aloud action and let the interceptor adopt it.
+      const readButton = resolvePlaybackAnchor();
+      if (isUsableButton(readButton)) {
+        activeReadButton = readButton;
+        awaitingNativeReadAudio = true;
+        readButton.click();
+      }
       updatePlaybackControls();
       return;
     }
@@ -877,7 +1058,21 @@
       target = Math.min(target, Math.max(0, media.duration - 0.05));
     }
 
+    // ChatGPT TTS is streamed through MediaSource. Forward seeking cannot go
+    // beyond the currently seekable window, so clamp to the live seek range.
     try {
+      if (media.seekable?.length) {
+        const start = media.seekable.start(0);
+        const end = media.seekable.end(media.seekable.length - 1);
+        target = Math.min(Math.max(target, start), Math.max(start, end - 0.02));
+      }
+    } catch {}
+
+    try {
+      // Use currentTime, not fastSeek(). fastSeek is explicitly allowed to
+      // trade precision for speed and can land away from the requested point.
+      // currentTime gives us an exact ±15 second target whenever that point is
+      // inside ChatGPT's currently seekable streaming window.
       media.currentTime = target;
 
       if (flowReadPaused) {
@@ -896,8 +1091,7 @@
   function stopManagedReadAloud() {
     const media = activeReadAudio;
 
-    // Real stop: no pause-event shield. ChatGPT may dispose the blob normally.
-    flowReadPaused = false;
+    clearFlowPauseState();
 
     if (media instanceof HTMLMediaElement && !media.paused) {
       try {
@@ -907,7 +1101,9 @@
 
     activeReadAudio = null;
     activeReadButton = null;
-    clearFlowPauseState();
+    activeReadTurn = null;
+    playbackPortalOffset = null;
+    playbackPortalRect = null;
     updatePlaybackControls();
     releaseReadLock();
   }
@@ -919,7 +1115,7 @@
   function installReadAloudMediaInterceptor() {
     const proto = window.HTMLMediaElement?.prototype;
 
-    if (!proto || proto.__chatgptFlowMediaHookV039) {
+    if (!proto || proto.__chatgptFlowMediaHookV046) {
       return;
     }
 
@@ -928,8 +1124,11 @@
 
     proto.play = function (...args) {
       const shouldCapture =
-        (awaitingAutoReadAudio || awaitingNativeReadAudio || this === activeReadAudio) &&
-        this instanceof HTMLMediaElement;
+        this instanceof HTMLMediaElement &&
+        (awaitingAutoReadAudio ||
+          awaitingNativeReadAudio ||
+          this === activeReadAudio ||
+          looksLikeChatGPTReadAudio(this));
 
       if (shouldCapture) {
         adoptReadAudio(this);
@@ -964,12 +1163,12 @@
       return result;
     };
 
-    Object.defineProperty(proto, "__chatgptFlowMediaHookV039", {
+    Object.defineProperty(proto, "__chatgptFlowMediaHookV046", {
       value: true,
       configurable: true,
     });
 
-    log("v0.3.9 detached Read aloud media hook installed");
+    log("v0.4.6 body-portal controls + virtual resumable pause hook installed");
   }
 
   installReadAloudMediaInterceptor();
@@ -979,12 +1178,15 @@
   // ---------------------------------------------------------------------------
 
   function pauseManagedReadAloud() {
+    // Lifecycle/cross-tab "pause" means a real stop. The center UI button uses
+    // beginFlowPause() directly and therefore remains resumable.
     if (
       activeReadAudio instanceof HTMLMediaElement &&
       !activeReadAudio.ended &&
       mediaHasSource(activeReadAudio)
     ) {
-      return beginFlowPause(activeReadAudio);
+      stopManagedReadAloud();
+      return true;
     }
 
     const stopButton = findNativeReadStopButton();
@@ -1517,6 +1719,7 @@
     log("Starting Read aloud for the new assistant response");
 
     activeReadButton = button;
+    activeReadTurn = targetTurn.closest?.("article") || targetTurn;
     button.click();
   }
 
@@ -1591,6 +1794,16 @@
       return;
     }
 
+    // Flow's own playback buttons bubble through this document-level capture
+    // listener. Older builds mistook our "Pause Read aloud" button for
+    // ChatGPT's native Stop/Pause button and cleared activeReadAudio BEFORE
+    // the button's own click handler ran. That made pause/resume do nothing
+    // and also caused the controls to disappear. Never classify our controls
+    // as native ChatGPT actions.
+    if (button.closest('[data-chatgpt-flow="playback-controls"]')) {
+      return;
+    }
+
     const label = buttonLabel(button);
 
     if (/^read aloud$/i.test(label)) {
@@ -1599,6 +1812,7 @@
       }
 
       activeReadButton = button;
+      activeReadTurn = button.closest("article") || button.closest('[data-message-author-role="assistant"]') || null;
       awaitingNativeReadAudio = true;
       return;
     }
@@ -1611,6 +1825,9 @@
       clearFlowPauseState();
       activeReadAudio = null;
       activeReadButton = null;
+      activeReadTurn = null;
+      playbackPortalOffset = null;
+      playbackPortalRect = null;
       updatePlaybackControls();
       releaseReadLock();
       return;
@@ -1692,6 +1909,9 @@
     subtree: true,
   });
 
+  window.addEventListener("scroll", schedulePlaybackUiPlacement, true);
+  window.addEventListener("resize", schedulePlaybackUiPlacement, { passive: true });
+
   document.addEventListener("click", onDocumentClick, true);
 
   document.addEventListener("keydown", onDocumentKeyDown, true);
@@ -1715,5 +1935,5 @@
     } catch {}
   });
 
-  log("v0.3.9 main controller loaded");
+  log("v0.4.5 main controller loaded");
 })();
