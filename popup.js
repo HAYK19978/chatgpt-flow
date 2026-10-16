@@ -5,10 +5,12 @@
   const DEFAULT_SETTINGS = {
     enabled: true,
     silenceMs: 5000,
+    playbackRate: 1,
   };
 
   const enabledInput = document.querySelector("#flow-enabled");
   const silenceInput = document.querySelector("#silence-seconds");
+  const playbackRateInput = document.querySelector("#playback-rate");
   const statusText = document.querySelector("#status-text");
 
   function clampSeconds(value) {
@@ -17,6 +19,14 @@
     if (!Number.isFinite(numeric)) return 5;
 
     return Math.min(90, Math.max(2, Math.round(numeric)));
+  }
+
+  function clampPlaybackRate(value) {
+    const numeric = Number(value);
+
+    if (!Number.isFinite(numeric)) return 1;
+
+    return Math.min(2, Math.max(0.5, Math.round(numeric * 4) / 4));
   }
 
   async function load() {
@@ -30,6 +40,10 @@
 
     silenceInput.value = String(
       clampSeconds((Number(settings.silenceMs) || 5000) / 1000),
+    );
+
+    playbackRateInput.value = String(
+      clampPlaybackRate(settings.playbackRate),
     );
 
     renderStatus();
@@ -50,6 +64,7 @@
       [SETTINGS_KEY]: {
         enabled: enabledInput.checked,
         silenceMs: seconds * 1000,
+        playbackRate: clampPlaybackRate(playbackRateInput.value),
       },
     });
 
@@ -61,6 +76,10 @@
   });
 
   silenceInput.addEventListener("change", () => {
+    save().catch(console.error);
+  });
+
+  playbackRateInput.addEventListener("change", () => {
     save().catch(console.error);
   });
 

@@ -78,8 +78,9 @@ h1 {
     font-size: 12px;
 }
 
-.number-wrap input {
-    width: 64px;
+.number-wrap input,
+.number-wrap select {
+    width: 76px;
     border: 1px solid #363a43;
     border-radius: 10px;
     padding: 8px 9px;
@@ -90,7 +91,8 @@ h1 {
     outline: none;
 }
 
-.number-wrap input:focus {
+.number-wrap input:focus,
+.number-wrap select:focus {
     border-color: #6f7cff;
 }
 

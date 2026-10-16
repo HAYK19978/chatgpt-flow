@@ -1,8 +1,8 @@
 (() => {
   "use strict";
 
-  if (window.__CHATGPT_FLOW_V032__) return;
-  window.__CHATGPT_FLOW_V032__ = true;
+  if (window.__CHATGPT_FLOW_V039__) return;
+  window.__CHATGPT_FLOW_V039__ = true;
 
   const DEFAULT_SILENCE_MS = 5000;
   const MIN_SILENCE_MS = 2000;
@@ -17,6 +17,9 @@
   const READ_TIMEOUT_MS = 300000;
   const READ_AUDIO_START_TIMEOUT_MS = 8000;
   const READ_LOCK_MAX_MS = 30 * 60 * 1000;
+  const DEFAULT_PLAYBACK_RATE = 1;
+  const MIN_PLAYBACK_RATE = 0.5;
+  const MAX_PLAYBACK_RATE = 2;
 
   const READ_SELECTOR = 'button[aria-label="Read aloud"]';
   const TRANSCRIBE_SEND_SELECTOR = 'button[aria-label="Transcribe and send"]';
@@ -43,6 +46,7 @@
 
   let enabled = true;
   let silenceMs = DEFAULT_SILENCE_MS;
+  let playbackRate = DEFAULT_PLAYBACK_RATE;
 
   let dictateRequested = false;
   let attachFallbackTimer = 0;
@@ -56,7 +60,14 @@
   let awaitingAutoReadAudio = false;
   let readAudioStartTimer = 0;
   let activeReadAudio = null;
+  let playbackControls = null;
+  let activeReadButton = null;
+  let flowReadPaused = false;
+  let flowPausePosition = 0;
+  let awaitingNativeReadAudio = false;
   let controlChannel = null;
+  let nativeMediaPlay = null;
+  let nativeMediaPause = null;
 
   function log(...args) {
     console.log("[ChatGPT Flow]", ...args);
@@ -72,6 +83,19 @@
     return Math.min(
       MAX_SILENCE_MS,
       Math.max(MIN_SILENCE_MS, Math.round(numeric)),
+    );
+  }
+
+  function clampPlaybackRate(value) {
+    const numeric = Number(value);
+
+    if (!Number.isFinite(numeric)) {
+      return DEFAULT_PLAYBACK_RATE;
+    }
+
+    return Math.min(
+      MAX_PLAYBACK_RATE,
+      Math.max(MIN_PLAYBACK_RATE, Math.round(numeric * 4) / 4),
     );
   }
 
@@ -92,16 +116,26 @@
 
     enabled = next.enabled !== false;
     silenceMs = clampSilenceMs(next.silenceMs);
+    playbackRate = clampPlaybackRate(next.playbackRate);
+
+    if (activeReadAudio instanceof HTMLMediaElement) {
+      try {
+        activeReadAudio.playbackRate = playbackRate;
+      } catch {}
+    }
+
+    updatePlaybackControls();
 
     log(
       enabled ? "enabled" : "disabled",
       `silence=${Math.round(silenceMs / 100) / 10}s`,
+      `speed=${playbackRate}x`,
     );
 
     if (!enabled) {
       cancelDictationMonitoring();
       cancelAutomaticRead();
-      pauseManagedReadAloud();
+      stopManagedReadAloud();
       releaseReadLock();
     }
   });
@@ -413,107 +447,559 @@
     );
   }
 
+  function sendPlaybackRateSetting() {
+    window.postMessage(
+      {
+        source: "chatgpt-flow-main",
+        type: "update-settings",
+        settings: { playbackRate },
+      },
+      "*",
+    );
+  }
+
+  function playbackIcon(kind) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("width", "20");
+    svg.setAttribute("height", "20");
+    svg.setAttribute("viewBox", "0 0 20 20");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("aria-hidden", "true");
+    svg.style.display = "block";
+
+    if (kind === "pause") {
+      svg.innerHTML = `
+        <path d="M6.75 4.25v11.5M13.25 4.25v11.5"
+          stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+      `;
+      return svg;
+    }
+
+    if (kind === "play") {
+      svg.innerHTML = `
+        <path d="M7 4.9v10.2c0 .62.69.99 1.21.65l7.2-4.68a1.28 1.28 0 0 0 0-2.14l-7.2-4.68A.78.78 0 0 0 7 4.9Z"
+          fill="currentColor"/>
+      `;
+      return svg;
+    }
+
+    const back = kind === "back";
+    svg.innerHTML = back
+      ? `
+        <path d="M5.1 5.55H2.85V3.3" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M3.05 5.35A7 7 0 1 1 3.5 14.9" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/>
+        <text x="10" y="12.15" text-anchor="middle" fill="currentColor"
+          font-size="6.2" font-weight="700" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif">15</text>
+      `
+      : `
+        <path d="M14.9 5.55h2.25V3.3" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M16.95 5.35A7 7 0 1 0 16.5 14.9" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/>
+        <text x="10" y="12.15" text-anchor="middle" fill="currentColor"
+          font-size="6.2" font-weight="700" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif">15</text>
+      `;
+
+    return svg;
+  }
+
+  function setPlaybackButtonIcon(button, kind) {
+    if (button.dataset.chatgptFlowIcon === kind) return;
+
+    button.dataset.chatgptFlowIcon = kind;
+    button.replaceChildren(playbackIcon(kind));
+  }
+
+  function stylePlaybackControlLikeChatGPT(button, anchor) {
+    if (anchor instanceof HTMLButtonElement && typeof anchor.className === "string") {
+      button.className = anchor.className;
+    } else {
+      button.className =
+        "no-drag cursor-interaction items-center select-none focus:outline-hidden whitespace-nowrap flex border gap-1 rounded-full text-tertiary border-transparent flex items-center justify-center p-0.5";
+    }
+
+    button.style.margin = "0";
+    button.style.flex = "0 0 auto";
+  }
+
+  function createPlaybackControl(title, onClick) {
+    const button = document.createElement("button");
+
+    button.type = "button";
+    button.title = title;
+    button.setAttribute("aria-label", title);
+
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      onClick();
+    });
+
+    return button;
+  }
+
+  function resolvePlaybackAnchor() {
+    // UI-only v0.3.9: always follow the last visible native Read aloud button.
+    // This makes the three Flow buttons deterministic even before audio exists.
+    const latestVisible = [...document.querySelectorAll(READ_SELECTOR)]
+      .filter(isUsableButton)
+      .at(-1);
+
+    if (latestVisible) {
+      return latestVisible;
+    }
+
+    return isUsableButton(activeReadButton) ? activeReadButton : null;
+  }
+
+  function placePlaybackControls() {
+    const controls = playbackControls;
+    const anchor = resolvePlaybackAnchor();
+
+    if (!controls?.root || !(anchor instanceof HTMLButtonElement)) {
+      return false;
+    }
+
+    activeReadButton = anchor;
+
+    for (const button of [controls.back, controls.toggle, controls.forward]) {
+      stylePlaybackControlLikeChatGPT(button, anchor);
+    }
+
+    const parent = anchor.parentElement;
+
+    if (!parent) return false;
+
+    if (controls.root.parentElement !== parent || controls.root.previousElementSibling !== anchor) {
+      anchor.insertAdjacentElement("afterend", controls.root);
+    }
+
+    return true;
+  }
+
+  function ensurePlaybackControls() {
+    if (playbackControls?.root) {
+      placePlaybackControls();
+      return playbackControls;
+    }
+
+    if (!document.body) {
+      return null;
+    }
+
+    const root = document.createElement("span");
+    root.id = "chatgpt-flow-playback-controls";
+    root.hidden = false;
+    root.setAttribute("data-chatgpt-flow", "playback-controls");
+
+    Object.assign(root.style, {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: "0",
+      verticalAlign: "middle",
+    });
+
+    const back = createPlaybackControl("Back 15 seconds", () => {
+      seekManagedReadAloud(-15);
+    });
+    setPlaybackButtonIcon(back, "back");
+
+    const toggle = createPlaybackControl("Pause Read aloud", () => {
+      toggleManagedReadAloud().catch((error) => {
+        log("Could not toggle Read aloud:", error);
+      });
+    });
+    setPlaybackButtonIcon(toggle, "pause");
+
+    const forward = createPlaybackControl("Forward 15 seconds", () => {
+      seekManagedReadAloud(15);
+    });
+    setPlaybackButtonIcon(forward, "forward");
+
+    root.append(back, toggle, forward);
+    playbackControls = { root, back, toggle, forward };
+    placePlaybackControls();
+
+    return playbackControls;
+  }
+
+  function mediaHasSource(media) {
+    return !!(media?.currentSrc || media?.src);
+  }
+
+  function updatePlaybackControls() {
+    const controls = ensurePlaybackControls();
+
+    if (!controls) return;
+
+    // v0.3.9 deliberately keeps the three controls visible whenever the
+    // native Read aloud action exists. Playback behavior will be refined
+    // separately after the UI placement is confirmed.
+    const placed = placePlaybackControls();
+
+    controls.root.hidden = !placed;
+    controls.root.style.display = placed ? "inline-flex" : "none";
+
+    if (!placed) return;
+
+    const media = activeReadAudio;
+    const activelyPlaying =
+      media instanceof HTMLMediaElement &&
+      !media.paused &&
+      !media.ended &&
+      mediaHasSource(media);
+
+    setPlaybackButtonIcon(
+      controls.toggle,
+      flowReadPaused || !activelyPlaying ? "play" : "pause",
+    );
+
+    controls.toggle.title = flowReadPaused
+      ? "Resume Read aloud"
+      : activelyPlaying
+        ? "Pause Read aloud"
+        : "Play / pause Read aloud";
+
+    controls.toggle.setAttribute("aria-label", controls.toggle.title);
+  }
+
+  function clearFlowPauseState() {
+    flowReadPaused = false;
+    flowPausePosition = 0;
+  }
+
+  function installManagedPauseEventShield(media) {
+    if (!(media instanceof HTMLMediaElement)) return;
+
+    const blockPauseCleanup = (event) => {
+      if (!flowReadPaused || activeReadAudio !== media) return;
+
+      // ChatGPT tears down its detached blob-backed audio from its pause
+      // handler. Flow owns this particular pause, so hide only this one pause
+      // event from page listeners. A real Stop still uses an ordinary pause.
+      event.stopImmediatePropagation();
+      event.stopPropagation();
+      log("Suppressed ChatGPT pause cleanup for resumable Read aloud");
+    };
+
+    media.addEventListener("pause", blockPauseCleanup, {
+      capture: true,
+      once: true,
+    });
+  }
+
+  function adoptReadAudio(media) {
+    if (!(media instanceof HTMLMediaElement)) return;
+
+    if (activeReadAudio && activeReadAudio !== media) {
+      clearFlowPauseState();
+    }
+
+    activeReadAudio = media;
+    awaitingAutoReadAudio = false;
+    awaitingNativeReadAudio = false;
+
+    if (!media.__chatgptFlowEndHookV039) {
+      media.addEventListener(
+        "ended",
+        () => {
+          if (activeReadAudio !== media) return;
+
+          clearFlowPauseState();
+          activeReadAudio = null;
+          activeReadButton = null;
+          updatePlaybackControls();
+          releaseReadLock();
+        },
+        { once: true },
+      );
+
+      try {
+        Object.defineProperty(media, "__chatgptFlowEndHookV039", {
+          value: true,
+          configurable: true,
+        });
+      } catch {}
+    }
+
+    if (readAudioStartTimer) {
+      clearTimeout(readAudioStartTimer);
+      readAudioStartTimer = 0;
+    }
+
+    try {
+      media.playbackRate = playbackRate;
+    } catch {}
+
+    updatePlaybackControls();
+  }
+
+  function beginFlowPause(media) {
+    if (
+      !(media instanceof HTMLMediaElement) ||
+      media.ended ||
+      !mediaHasSource(media)
+    ) {
+      return false;
+    }
+
+    if (flowReadPaused && media === activeReadAudio) {
+      return true;
+    }
+
+    activeReadAudio = media;
+    flowPausePosition = Number.isFinite(media.currentTime)
+      ? media.currentTime
+      : 0;
+    flowReadPaused = true;
+
+    installManagedPauseEventShield(media);
+
+    try {
+      const pause = nativeMediaPause || HTMLMediaElement.prototype.pause;
+      pause.call(media);
+      media.currentTime = flowPausePosition;
+    } catch (error) {
+      flowReadPaused = false;
+      log("Read aloud pause failed:", error);
+      return false;
+    }
+
+    // If the page changed the source synchronously despite the pause-event
+    // shield, do not pretend the media is resumable.
+    queueMicrotask(() => {
+      if (activeReadAudio !== media || !flowReadPaused) return;
+
+      if (!mediaHasSource(media)) {
+        log("Read aloud source disappeared after pause");
+        clearFlowPauseState();
+        activeReadAudio = null;
+        activeReadButton = null;
+      }
+
+      updatePlaybackControls();
+    });
+
+    updatePlaybackControls();
+    releaseReadLock();
+
+    log("Read aloud paused at", flowPausePosition.toFixed(2));
+    return true;
+  }
+
+  async function resumeFlowPausedReadAloud() {
+    const media = activeReadAudio;
+
+    if (
+      !(media instanceof HTMLMediaElement) ||
+      media.ended ||
+      !mediaHasSource(media)
+    ) {
+      clearFlowPauseState();
+      activeReadAudio = null;
+      activeReadButton = null;
+      updatePlaybackControls();
+      return false;
+    }
+
+    broadcastPauseReadAloud();
+
+    const lockGranted = await acquireReadLock();
+
+    if (!lockGranted) {
+      log("Another ChatGPT tab is already reading; resume skipped");
+      return false;
+    }
+
+    const resumeAt = flowPausePosition;
+
+    try {
+      media.currentTime = resumeAt;
+      media.playbackRate = playbackRate;
+      flowReadPaused = false;
+
+      const play = nativeMediaPlay || HTMLMediaElement.prototype.play;
+      const promise = play.call(media);
+
+      if (promise?.then) {
+        promise.then(
+          () => updatePlaybackControls(),
+          (error) => {
+            flowReadPaused = true;
+            log("Read aloud resume play() failed:", error);
+            releaseReadLock();
+            updatePlaybackControls();
+          },
+        );
+      }
+
+      updatePlaybackControls();
+      log("Read aloud resumed from", resumeAt.toFixed(2));
+      return true;
+    } catch (error) {
+      flowReadPaused = true;
+      releaseReadLock();
+      updatePlaybackControls();
+      throw error;
+    }
+  }
+
+  async function toggleManagedReadAloud() {
+    const media = activeReadAudio;
+
+    if (!(media instanceof HTMLMediaElement) || media.ended) {
+      updatePlaybackControls();
+      return;
+    }
+
+    if (flowReadPaused) {
+      await resumeFlowPausedReadAloud();
+      return;
+    }
+
+    beginFlowPause(media);
+  }
+
+  function seekManagedReadAloud(deltaSeconds) {
+    const media = activeReadAudio;
+
+    if (
+      !(media instanceof HTMLMediaElement) ||
+      media.ended ||
+      !mediaHasSource(media)
+    ) {
+      updatePlaybackControls();
+      return false;
+    }
+
+    const base = flowReadPaused ? flowPausePosition : media.currentTime;
+    let target = Math.max(0, base + deltaSeconds);
+
+    if (Number.isFinite(media.duration)) {
+      target = Math.min(target, Math.max(0, media.duration - 0.05));
+    }
+
+    try {
+      media.currentTime = target;
+
+      if (flowReadPaused) {
+        flowPausePosition = target;
+      }
+
+      updatePlaybackControls();
+      log("Read aloud seek", `${deltaSeconds > 0 ? "+" : ""}${deltaSeconds}s`, target);
+      return true;
+    } catch (error) {
+      log("Read aloud seek failed:", error);
+      return false;
+    }
+  }
+
+  function stopManagedReadAloud() {
+    const media = activeReadAudio;
+
+    // Real stop: no pause-event shield. ChatGPT may dispose the blob normally.
+    flowReadPaused = false;
+
+    if (media instanceof HTMLMediaElement && !media.paused) {
+      try {
+        (nativeMediaPause || HTMLMediaElement.prototype.pause).call(media);
+      } catch {}
+    }
+
+    activeReadAudio = null;
+    activeReadButton = null;
+    clearFlowPauseState();
+    updatePlaybackControls();
+    releaseReadLock();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Read-aloud media interception
+  // ---------------------------------------------------------------------------
+
+  function installReadAloudMediaInterceptor() {
+    const proto = window.HTMLMediaElement?.prototype;
+
+    if (!proto || proto.__chatgptFlowMediaHookV039) {
+      return;
+    }
+
+    nativeMediaPlay = proto.play;
+    nativeMediaPause = proto.pause;
+
+    proto.play = function (...args) {
+      const shouldCapture =
+        (awaitingAutoReadAudio || awaitingNativeReadAudio || this === activeReadAudio) &&
+        this instanceof HTMLMediaElement;
+
+      if (shouldCapture) {
+        adoptReadAudio(this);
+
+        queueMicrotask(() => {
+          updatePlaybackControls();
+          log("Read aloud media captured", {
+            connected: this.isConnected,
+            currentTime: this.currentTime,
+            duration: this.duration,
+            src: this.currentSrc || this.src,
+          });
+        });
+      }
+
+      return nativeMediaPlay.apply(this, args);
+    };
+
+    proto.pause = function (...args) {
+      const managed = this === activeReadAudio;
+      const result = nativeMediaPause.apply(this, args);
+
+      if (managed && !flowReadPaused) {
+        queueMicrotask(() => {
+          if (this.paused) {
+            releaseReadLock();
+          }
+          updatePlaybackControls();
+        });
+      }
+
+      return result;
+    };
+
+    Object.defineProperty(proto, "__chatgptFlowMediaHookV039", {
+      value: true,
+      configurable: true,
+    });
+
+    log("v0.3.9 detached Read aloud media hook installed");
+  }
+
+  installReadAloudMediaInterceptor();
+
   // ---------------------------------------------------------------------------
   // Read-aloud pause / lifecycle
   // ---------------------------------------------------------------------------
 
   function pauseManagedReadAloud() {
-    let paused = false;
-
     if (
       activeReadAudio instanceof HTMLMediaElement &&
-      !activeReadAudio.paused &&
-      !activeReadAudio.ended
+      !activeReadAudio.ended &&
+      mediaHasSource(activeReadAudio)
     ) {
+      return beginFlowPause(activeReadAudio);
+    }
+
+    const stopButton = findNativeReadStopButton();
+
+    if (stopButton) {
       try {
-        activeReadAudio.pause();
-        paused = true;
+        stopButton.click();
+        releaseReadLock();
+        return true;
       } catch {}
     }
 
-    if (!paused) {
-      for (const media of document.querySelectorAll("audio")) {
-        if (
-          !(media instanceof HTMLMediaElement) ||
-          media.paused ||
-          media.ended
-        ) {
-          continue;
-        }
-
-        try {
-          media.pause();
-          activeReadAudio = media;
-          paused = true;
-          break;
-        } catch {}
-      }
-    }
-
-    if (!paused) {
-      const stopButton = findNativeReadStopButton();
-
-      if (stopButton) {
-        try {
-          stopButton.click();
-          paused = true;
-        } catch {}
-      }
-    }
-
-    if (paused) {
-      log("Paused Read aloud before dictation");
-    }
-
     releaseReadLock();
-
-    return paused;
+    return false;
   }
-
-  document.addEventListener(
-    "play",
-    (event) => {
-      const media = event.target;
-
-      if (!(media instanceof HTMLMediaElement)) {
-        return;
-      }
-
-      if (!readLockHeld && !awaitingAutoReadAudio) {
-        return;
-      }
-
-      activeReadAudio = media;
-      awaitingAutoReadAudio = false;
-
-      if (readAudioStartTimer) {
-        clearTimeout(readAudioStartTimer);
-
-        readAudioStartTimer = 0;
-      }
-
-      log("Read aloud audio started");
-    },
-    true,
-  );
-
-  function onManagedMediaStopped(event) {
-    const media = event.target;
-
-    if (!(media instanceof HTMLMediaElement) || media !== activeReadAudio) {
-      return;
-    }
-
-    if (media.paused || media.ended) {
-      log(media.ended ? "Read aloud finished" : "Read aloud paused");
-
-      releaseReadLock();
-    }
-  }
-
-  document.addEventListener("pause", onManagedMediaStopped, true);
-
-  document.addEventListener("ended", onManagedMediaStopped, true);
 
   // ---------------------------------------------------------------------------
   // Dictation stream capture
@@ -623,7 +1109,7 @@
       return stream;
     };
 
-    log("v0.3.2 native microphone hook installed");
+    log("v0.3.6 native microphone hook installed");
   } else {
     log("navigator.mediaDevices.getUserMedia is unavailable");
   }
@@ -846,38 +1332,8 @@
 
     audioSession = session;
 
-    if (typeof audioContext.createScriptProcessor === "function") {
-      const processor = audioContext.createScriptProcessor(1024, 1, 1);
-
-      const silentGain = audioContext.createGain();
-
-      silentGain.gain.value = 0;
-
-      processor.onaudioprocess = (event) => {
-        if (audioSession !== session) {
-          return;
-        }
-
-        const input = event.inputBuffer.getChannelData(0);
-
-        const rms = calculateRmsFromFloat32(input);
-
-        processAudioLevel(session, rms, performance.now());
-      };
-
-      source.connect(processor);
-      processor.connect(silentGain);
-      silentGain.connect(audioContext.destination);
-
-      session.processor = processor;
-
-      session.silentGain = silentGain;
-
-      log("Monitoring ChatGPT microphone stream with audio callbacks");
-
-      return;
-    }
-
+    // v0.3.3: use the stable analyser/timer path.
+    // ScriptProcessor callbacks proved unreliable for silence auto-send in v0.3.2.
     const analyser = audioContext.createAnalyser();
 
     analyser.fftSize = 1024;
@@ -1060,6 +1516,7 @@
 
     log("Starting Read aloud for the new assistant response");
 
+    activeReadButton = button;
     button.click();
   }
 
@@ -1136,6 +1593,29 @@
 
     const label = buttonLabel(button);
 
+    if (/^read aloud$/i.test(label)) {
+      if (flowReadPaused) {
+        stopManagedReadAloud();
+      }
+
+      activeReadButton = button;
+      awaitingNativeReadAudio = true;
+      return;
+    }
+
+    if (
+      activeReadAudio &&
+      !isStopGeneratingButton(button) &&
+      /^(?:stop|pause)(?:\s+(?:reading|read aloud|audio))?$/i.test(label)
+    ) {
+      clearFlowPauseState();
+      activeReadAudio = null;
+      activeReadButton = null;
+      updatePlaybackControls();
+      releaseReadLock();
+      return;
+    }
+
     if (/^dictate$/i.test(label)) {
       if (enabled) {
         beginDictationMonitoring();
@@ -1192,14 +1672,42 @@
     armAutomaticRead();
   }
 
+  let playbackUiFrame = 0;
+
+  function schedulePlaybackUiPlacement() {
+    if (playbackUiFrame) return;
+
+    playbackUiFrame = requestAnimationFrame(() => {
+      playbackUiFrame = 0;
+      updatePlaybackControls();
+    });
+  }
+
+  const playbackUiObserver = new MutationObserver(() => {
+    schedulePlaybackUiPlacement();
+  });
+
+  playbackUiObserver.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+
   document.addEventListener("click", onDocumentClick, true);
 
   document.addEventListener("keydown", onDocumentKeyDown, true);
 
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", ensurePlaybackControls, { once: true });
+  } else {
+    ensurePlaybackControls();
+  }
+
   window.addEventListener("pagehide", () => {
+    playbackUiObserver.disconnect();
+
     cancelDictationMonitoring();
     cancelAutomaticRead();
-    pauseManagedReadAloud();
+    stopManagedReadAloud();
     releaseReadLock();
 
     try {
@@ -1207,5 +1715,5 @@
     } catch {}
   });
 
-  log("v0.3.2 main controller loaded");
+  log("v0.3.9 main controller loaded");
 })();
