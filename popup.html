@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="ru">
 
 <head>
     <meta charset="utf-8" />
@@ -9,25 +9,30 @@
 </head>
 
 <body>
-    <main class="popup">
-        <div class="title-row">
+    <main class="panel">
+        <header class="header">
             <div>
                 <h1>ChatGPT Flow</h1>
-                <p>Hands-free dictation and automatic read aloud.</p>
+                <p id="status-text">Flow включён</p>
             </div>
 
-            <label class="switch" aria-label="Enable ChatGPT Flow">
-                <input id="enabled" type="checkbox" />
+            <label class="switch" aria-label="Включить или выключить ChatGPT Flow">
+                <input id="flow-enabled" type="checkbox" />
                 <span class="slider"></span>
             </label>
-        </div>
+        </header>
 
-        <div class="details">
-            <div><strong>Silence:</strong> 5 seconds</div>
-            <div><strong>Read aloud:</strong> 1 second after reply finishes</div>
-        </div>
+        <section class="setting">
+            <div class="setting-copy">
+                <label for="silence-seconds">Отправка после тишины</label>
+                <span>От двух до девяноста секунд</span>
+            </div>
 
-        <div id="status" class="status">Enabled</div>
+            <div class="number-wrap">
+                <input id="silence-seconds" type="number" min="2" max="90" step="1" inputmode="numeric" />
+                <span>сек</span>
+            </div>
+        </section>
     </main>
 
     <script src="popup.js"></script>

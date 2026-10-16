@@ -2,22 +2,24 @@
   "use strict";
 
   const SETTINGS_KEY = "chatgptFlowSettings";
-  const DEFAULT_SETTINGS = Object.freeze({ enabled: true });
+  const DEFAULT_SETTINGS = {
+    enabled: true,
+    silenceMs: 5000,
+  };
 
-  const enabledInput = document.getElementById("enabled");
-  const status = document.getElementById("status");
+  const enabledInput = document.querySelector("#flow-enabled");
+  const silenceInput = document.querySelector("#silence-seconds");
+  const statusText = document.querySelector("#status-text");
 
-  async function save() {
-    const enabled = enabledInput.checked;
+  function clampSeconds(value) {
+    const numeric = Number(value);
 
-    await chrome.storage.local.set({
-      [SETTINGS_KEY]: { enabled },
-    });
+    if (!Number.isFinite(numeric)) return 5;
 
-    status.textContent = enabled ? "Enabled" : "Disabled";
+    return Math.min(90, Math.max(2, Math.round(numeric)));
   }
 
-  async function init() {
+  async function load() {
     const stored = await chrome.storage.local.get({
       [SETTINGS_KEY]: DEFAULT_SETTINGS,
     });
@@ -25,13 +27,48 @@
     const settings = stored[SETTINGS_KEY] || DEFAULT_SETTINGS;
 
     enabledInput.checked = settings.enabled !== false;
-    status.textContent = enabledInput.checked ? "Enabled" : "Disabled";
 
-    enabledInput.addEventListener("change", save);
+    silenceInput.value = String(
+      clampSeconds((Number(settings.silenceMs) || 5000) / 1000),
+    );
+
+    renderStatus();
   }
 
-  init().catch((error) => {
-    console.debug("[ChatGPT Flow] popup init failed:", error);
-    status.textContent = "Could not load settings";
+  function renderStatus() {
+    statusText.textContent = enabledInput.checked
+      ? "Flow включён"
+      : "Flow выключен";
+  }
+
+  async function save() {
+    const seconds = clampSeconds(silenceInput.value);
+
+    silenceInput.value = String(seconds);
+
+    await chrome.storage.local.set({
+      [SETTINGS_KEY]: {
+        enabled: enabledInput.checked,
+        silenceMs: seconds * 1000,
+      },
+    });
+
+    renderStatus();
+  }
+
+  enabledInput.addEventListener("change", () => {
+    save().catch(console.error);
   });
+
+  silenceInput.addEventListener("change", () => {
+    save().catch(console.error);
+  });
+
+  silenceInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      silenceInput.blur();
+    }
+  });
+
+  load().catch(console.error);
 })();

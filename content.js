@@ -2,14 +2,23 @@
   "use strict";
 
   const SETTINGS_KEY = "chatgptFlowSettings";
-
   const DEFAULT_SETTINGS = {
     enabled: true,
+    silenceMs: 5000,
   };
 
-  let settings = {
-    ...DEFAULT_SETTINGS,
-  };
+  function normalizeSettings(value) {
+    const silenceMs = Number(value?.silenceMs);
+
+    return {
+      enabled: value?.enabled !== false,
+      silenceMs: Number.isFinite(silenceMs)
+        ? Math.min(90000, Math.max(2000, Math.round(silenceMs)))
+        : DEFAULT_SETTINGS.silenceMs,
+    };
+  }
+
+  let settings = { ...DEFAULT_SETTINGS };
 
   function sendSettings() {
     window.postMessage(
@@ -27,12 +36,7 @@
       [SETTINGS_KEY]: DEFAULT_SETTINGS,
     });
 
-    const value = stored[SETTINGS_KEY] || DEFAULT_SETTINGS;
-
-    settings = {
-      enabled: value.enabled !== false,
-    };
-
+    settings = normalizeSettings(stored[SETTINGS_KEY]);
     sendSettings();
   }
 
@@ -49,15 +53,11 @@
   });
 
   chrome.storage.onChanged.addListener((changes, areaName) => {
-    if (areaName !== "local" || !changes[SETTINGS_KEY]) {
-      return;
-    }
+    if (areaName !== "local" || !changes[SETTINGS_KEY]) return;
 
-    const value = changes[SETTINGS_KEY].newValue || DEFAULT_SETTINGS;
-
-    settings = {
-      enabled: value.enabled !== false,
-    };
+    settings = normalizeSettings(
+      changes[SETTINGS_KEY].newValue || DEFAULT_SETTINGS,
+    );
 
     sendSettings();
   });
