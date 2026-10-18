@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Flow",
-  "version": "0.4.6",
-  "description": "Hands-free ChatGPT dictation with silence auto-send, automatic Read aloud, body-portal playback controls that survive ChatGPT rerenders, exact 15-second seek, virtual pause, and live speed control.",
+  "version": "0.4.7",
+  "description": "Hands-free ChatGPT dictation with silence auto-send, automatic Read aloud, message-bound playback controls, exact 15-second seek, virtual pause, and live speed control.",
   "permissions": [
     "storage"
   ],
@@ -39,7 +39,8 @@
         "https://chat.openai.com/*"
       ],
       "js": [
-        "flow-main.js"
+        "flow-main.js",
+        "flow-ui.js"
       ],
       "run_at": "document_start",
       "world": "MAIN"
