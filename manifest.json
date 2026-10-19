@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Flow",
-  "version": "0.5.9",
-  "description": "Hands-free ChatGPT workflow with silence auto-send, response-ready sound, single cross-tab automatic Read aloud, response-scoped play/pause/resume, fine seek controls and speed control.",
+  "version": "0.5.20",
+  "description": "Hands-free ChatGPT workflow with queued Play/Pause, stale playback-state reconciliation, direct speed selection, automatic Read aloud and single-playback arbitration.",
   "permissions": [
     "storage",
     "offscreen"

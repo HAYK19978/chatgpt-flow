@@ -1,18 +1,69 @@
 (() => {
   "use strict";
 
-  if (window.__CHATGPT_FLOW_ROW_UI_V053__) return;
-  window.__CHATGPT_FLOW_ROW_UI_V053__ = true;
+  if (window.__CHATGPT_FLOW_ROW_UI_V0518__) return;
+  window.__CHATGPT_FLOW_ROW_UI_V0518__ = true;
 
   const ROW_SELECTOR = ".turn-action-controls";
   const CONTROL_ATTR = "data-chatgpt-flow-row-controls";
+  const SPEED_MENU_ATTR = "data-chatgpt-flow-speed-menu";
+  const SPEEDS = [0.75, 1, 1.25, 1.5, 1.75, 2];
+
   let frame = 0;
   let controlsEnabled = true;
+  let speedMenu = null;
+  let speedMenuAnchor = null;
 
   const style = document.createElement("style");
   style.textContent = `
     [${CONTROL_ATTR}] { display: contents !important; }
     html.chatgpt-flow-controls-off [${CONTROL_ATTR}] { display: none !important; }
+
+    [${SPEED_MENU_ATTR}] {
+      position: fixed;
+      z-index: 2147483647;
+      min-width: 94px;
+      padding: 6px;
+      border-radius: 12px;
+      background: var(--main-surface-primary, Canvas);
+      color: var(--text-primary, CanvasText);
+      box-shadow:
+        0 10px 30px rgba(0, 0, 0, .18),
+        0 0 0 1px rgba(128, 128, 128, .22);
+      font: inherit;
+    }
+
+    [${SPEED_MENU_ATTR}] button {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      width: 100%;
+      min-height: 32px;
+      padding: 5px 9px;
+      border: 0;
+      border-radius: 8px;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      font-size: 13px;
+      cursor: pointer;
+      text-align: left;
+    }
+
+    [${SPEED_MENU_ATTR}] button:hover,
+    [${SPEED_MENU_ATTR}] button:focus-visible {
+      background: rgba(128, 128, 128, .16);
+      outline: none;
+    }
+
+    [${SPEED_MENU_ATTR}] button[data-selected="true"] {
+      font-weight: 650;
+    }
+
+    [${SPEED_MENU_ATTR}] .chatgpt-flow-speed-check {
+      width: 18px;
+      text-align: center;
+    }
   `;
   (document.head || document.documentElement).appendChild(style);
 
@@ -29,7 +80,9 @@
   function nativeAnchor(row) {
     const buttons = nativeButtons(row);
     return (
-      buttons.find((button) => /^Read aloud$/i.test(label(button))) ||
+      buttons.find((button) =>
+        /^(?:Read aloud|Stop reading aloud)$/i.test(label(button)),
+      ) ||
       buttons.find((button) => /^Regenerate response$/i.test(label(button))) ||
       buttons.find((button) => /^Rate response$/i.test(label(button))) ||
       buttons.find((button) => /^Copy$/i.test(label(button))) ||
@@ -39,7 +92,9 @@
 
   function isAssistantRow(row) {
     return nativeButtons(row).some((button) =>
-      /^(?:Read aloud|Regenerate response|Rate response)$/i.test(label(button)),
+      /^(?:Read aloud|Stop reading aloud|Regenerate response|Rate response)$/i.test(
+        label(button),
+      ),
     );
   }
 
@@ -90,16 +145,101 @@
     button.title = aria;
     button.style.margin = "0";
     button.style.flex = "0 0 auto";
+    button.style.cursor = "pointer";
+    button.style.touchAction = "manipulation";
+    button.dataset.flowIcon = kind;
     button.appendChild(icon(kind));
 
     button.addEventListener("click", (event) => {
-      event.preventDefault();
       event.stopPropagation();
-      onClick();
+      onClick(event);
       schedule();
     });
 
     return button;
+  }
+
+  function closeSpeedMenu() {
+    if (speedMenu) speedMenu.remove();
+    speedMenu = null;
+    speedMenuAnchor = null;
+  }
+
+  function positionSpeedMenu() {
+    if (!speedMenu || !speedMenuAnchor?.isConnected) {
+      closeSpeedMenu();
+      return;
+    }
+
+    const rect = speedMenuAnchor.getBoundingClientRect();
+    const menuRect = speedMenu.getBoundingClientRect();
+    const gap = 7;
+
+    let left = rect.left + rect.width / 2 - menuRect.width / 2;
+    left = Math.max(8, Math.min(left, innerWidth - menuRect.width - 8));
+
+    let top = rect.top - menuRect.height - gap;
+    if (top < 8) top = rect.bottom + gap;
+
+    speedMenu.style.left = `${Math.round(left)}px`;
+    speedMenu.style.top = `${Math.round(top)}px`;
+  }
+
+  function openSpeedMenu(anchorButton, row) {
+    if (speedMenuAnchor === anchorButton && speedMenu) {
+      closeSpeedMenu();
+      return;
+    }
+
+    closeSpeedMenu();
+
+    const state =
+      window.__CHATGPT_FLOW_CONTROLLER__?.state?.(row) || { rate: 1 };
+    const current = Number(state.rate || 1);
+
+    const menu = document.createElement("div");
+    menu.setAttribute(SPEED_MENU_ATTR, "");
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", "Read aloud speed");
+
+    for (const rate of SPEEDS) {
+      const option = document.createElement("button");
+      option.type = "button";
+      option.setAttribute("role", "menuitemradio");
+      option.setAttribute(
+        "aria-checked",
+        Math.abs(rate - current) < 0.001 ? "true" : "false",
+      );
+      option.dataset.selected =
+        Math.abs(rate - current) < 0.001 ? "true" : "false";
+
+      const value = document.createElement("span");
+      value.textContent = `${rate}×`;
+
+      const check = document.createElement("span");
+      check.className = "chatgpt-flow-speed-check";
+      check.textContent =
+        Math.abs(rate - current) < 0.001 ? "✓" : "";
+
+      option.append(value, check);
+
+      option.addEventListener("click", (event) => {
+        event.stopPropagation();
+        window.__CHATGPT_FLOW_CONTROLLER__?.setSpeed?.(rate);
+        closeSpeedMenu();
+        schedule();
+      });
+
+      menu.appendChild(option);
+    }
+
+    document.body.appendChild(menu);
+    speedMenu = menu;
+    speedMenuAnchor = anchorButton;
+    positionSpeedMenu();
+
+    const selected = menu.querySelector('[data-selected="true"]');
+    selected?.focus({ preventScroll: true });
   }
 
   function createGroup(row, anchor) {
@@ -132,10 +272,11 @@
       anchor,
       "Read aloud speed: 1×",
       "play",
-      () => window.__CHATGPT_FLOW_CONTROLLER__?.cycleSpeed?.(),
+      () => openSpeedMenu(speed, row),
     );
 
     speed.replaceChildren();
+    delete speed.dataset.flowIcon;
     Object.assign(speed.style, {
       fontSize: "11px",
       fontWeight: "600",
@@ -169,9 +310,13 @@
         rate: 1,
       };
 
-    group.toggle.replaceChildren(
-      icon(state.active && !state.paused ? "pause" : "play"),
-    );
+    const nextIcon =
+      state.active && !state.paused ? "pause" : "play";
+
+    if (group.toggle.dataset.flowIcon !== nextIcon) {
+      group.toggle.dataset.flowIcon = nextIcon;
+      group.toggle.replaceChildren(icon(nextIcon));
+    }
 
     const toggleTitle = state.active
       ? state.paused
@@ -183,7 +328,9 @@
     group.toggle.title = toggleTitle;
 
     const speedText = `${state.rate || 1}×`;
-    group.speed.textContent = speedText;
+    if (group.speed.textContent !== speedText) {
+      group.speed.textContent = speedText;
+    }
     group.speed.setAttribute("aria-label", `Read aloud speed: ${speedText}`);
     group.speed.title = group.speed.getAttribute("aria-label");
   }
@@ -225,6 +372,7 @@
     frame = requestAnimationFrame(() => {
       frame = 0;
       mountAll();
+      if (speedMenu) positionSpeedMenu();
     });
   }
 
@@ -238,10 +386,34 @@
     }
 
     controlsEnabled = event.data.settings?.enabled !== false;
+    if (!controlsEnabled) closeSpeedMenu();
     schedule();
   });
 
   window.addEventListener("chatgpt-flow-playback-state", schedule);
+
+  document.addEventListener(
+    "pointerdown",
+    (event) => {
+      if (!speedMenu) return;
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (speedMenu.contains(target) || speedMenuAnchor?.contains(target)) return;
+      closeSpeedMenu();
+    },
+    true,
+  );
+
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      if (event.key === "Escape") closeSpeedMenu();
+    },
+    true,
+  );
+
+  window.addEventListener("resize", positionSpeedMenu);
+  window.addEventListener("scroll", positionSpeedMenu, true);
 
   const observer = new MutationObserver(schedule);
 
@@ -261,7 +433,10 @@
 
   window.addEventListener(
     "pagehide",
-    () => observer.disconnect(),
+    () => {
+      observer.disconnect();
+      closeSpeedMenu();
+    },
     { once: true },
   );
 

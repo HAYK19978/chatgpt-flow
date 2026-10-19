@@ -1,8 +1,8 @@
 (() => {
   "use strict";
 
-  if (window.__CHATGPT_FLOW_CONTROLLER_V059__) return;
-  window.__CHATGPT_FLOW_CONTROLLER_V059__ = true;
+  if (window.__CHATGPT_FLOW_CONTROLLER_V0520__) return;
+  window.__CHATGPT_FLOW_CONTROLLER_V0520__ = true;
 
   const READ_SELECTOR = 'button[aria-label="Read aloud"]';
   const TRANSCRIBE_SELECTOR = 'button[aria-label="Transcribe and send"]';
@@ -12,15 +12,17 @@
   const SEND_SELECTOR =
     'button[data-testid="send-button"],button[aria-label="Send"],button[aria-label="Send prompt"],button[aria-label="Send message"]';
   const STOP_GENERATION_SELECTOR = 'button[data-testid="stop-button"]';
-  const AUTO_READ_LOCK = "chatgpt-flow-auto-read-v059";
-  const PLAYBACK_CHANNEL = "chatgpt-flow-playback-v059";
+  const AUTO_READ_LOCK = "chatgpt-flow-auto-read-v0518";
+  const PLAYBACK_CHANNEL = "chatgpt-flow-playback-v0518";
+  const PLAYBACK_OWNER_KEY = "chatgpt-flow-playback-owner";
+  const PLAYBACK_OWNER_TTL_MS = 8000;
   const TAB_ID = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
 
   // The UI intentionally still says 15. ChatGPT's streamed TTS timeline has
   // behaved much "wider" than wall-clock time in real use, so use a gentler
   // internal step. This can be tuned later without changing the UI.
   const DISPLAYED_SEEK_SECONDS = 15;
-  const INTERNAL_SEEK_SECONDS = 1.5;
+  const INTERNAL_SEEK_SECONDS = 3.6;
 
   const DEFAULTS = {
     enabled: true,
@@ -62,6 +64,23 @@
   let virtualPauseTimer = 0;
   let pauseGuardHook = null;
   let pauseGuardPreviousPlay = null;
+
+  // Resume is implemented by ChatGPT's own Stop/Read-aloud controls.
+  // We never keep a global play() guard while paused, because that poisoned
+  // subsequent native Read aloud attempts.
+  let resumeSeekTarget = null;
+
+  // nativeButtonClick.call(Stop reading aloud) dispatches a normal click event.
+  // Without this flag, our document listener mistakes Flow's own Pause for a
+  // manual native Stop and immediately wipes activeReadKey/virtualPaused,
+  // making Resume impossible.
+  let flowInitiatedNativeStop = false;
+
+  // Native Read aloud changes between Read/Stop asynchronously. A custom
+  // transport click that lands during that short transition must be queued,
+  // not silently ignored or interpreted as a second Play.
+  let transportIntent = null;
+  let transportIntentTimer = 0;
 
   // A response may be manually played before its delayed Auto Read fires.
   // Track handled response keys so the same answer cannot start a second lap.
@@ -119,7 +138,7 @@
   function isAssistantActionRow(row) {
     if (!(row instanceof Element) || !row.isConnected) return false;
     return nativeButtonsIn(row).some((button) =>
-      /^(?:Read aloud|Regenerate response|Rate response)$/i.test(
+      /^(?:Read aloud|Stop reading aloud|Regenerate response|Rate response)$/i.test(
         buttonLabel(button),
       ),
     );
@@ -129,7 +148,7 @@
     if (!(row instanceof Element)) return null;
     return (
       nativeButtonsIn(row).find((button) =>
-        /^Read aloud$/i.test(buttonLabel(button)),
+        /^(?:Read aloud|Stop reading aloud)$/i.test(buttonLabel(button)),
       ) || null
     );
   }
@@ -232,6 +251,50 @@
     } catch {}
   }
 
+  function readPlaybackOwner() {
+    try {
+      const raw = localStorage.getItem(PLAYBACK_OWNER_KEY);
+      if (!raw) return null;
+
+      const owner = JSON.parse(raw);
+      const at = Number(owner?.at) || 0;
+
+      if (
+        !owner?.tabId ||
+        !at ||
+        Date.now() - at > PLAYBACK_OWNER_TTL_MS
+      ) {
+        localStorage.removeItem(PLAYBACK_OWNER_KEY);
+        return null;
+      }
+
+      return owner;
+    } catch {
+      return null;
+    }
+  }
+
+  function claimPlaybackOwner() {
+    try {
+      localStorage.setItem(
+        PLAYBACK_OWNER_KEY,
+        JSON.stringify({
+          tabId: TAB_ID,
+          at: Date.now(),
+        }),
+      );
+    } catch {}
+  }
+
+  function releasePlaybackOwner() {
+    try {
+      const owner = readPlaybackOwner();
+      if (owner?.tabId === TAB_ID) {
+        localStorage.removeItem(PLAYBACK_OWNER_KEY);
+      }
+    } catch {}
+  }
+
   function pruneRemotePlayback() {
     const now = Date.now();
     for (const [tabId, at] of remotePlayback) {
@@ -241,7 +304,28 @@
 
   function otherTabPlaybackActive() {
     pruneRemotePlayback();
-    return remotePlayback.size > 0;
+
+    const owner = readPlaybackOwner();
+    if (owner?.tabId && owner.tabId !== TAB_ID) return true;
+
+    return [...remotePlayback.keys()].some((tabId) => tabId !== TAB_ID);
+  }
+
+  function nativePlaybackVisible() {
+    return !!document.querySelector(
+      'button[aria-label="Stop reading aloud"]',
+    );
+  }
+
+  function localPlaybackLooksActive() {
+    return (
+      !virtualPaused &&
+      (
+        mediaActuallyPlaying(activeMedia) ||
+        nativePlaybackVisible() ||
+        capturePendingFor()
+      )
+    );
   }
 
   if (playbackChannel) {
@@ -258,15 +342,19 @@
   }
 
   function startPlaybackHeartbeat() {
-    if (playbackHeartbeatTimer) return;
+    claimPlaybackOwner();
     announcePlayback("playing");
+
+    if (playbackHeartbeatTimer) return;
+
     playbackHeartbeatTimer = window.setInterval(() => {
-      if (mediaHasSource(activeMedia)) {
+      if (localPlaybackLooksActive()) {
+        claimPlaybackOwner();
         announcePlayback("playing");
       } else {
         stopPlaybackHeartbeat();
       }
-    }, 5000);
+    }, 2000);
   }
 
   function stopPlaybackHeartbeat() {
@@ -274,6 +362,8 @@
       clearInterval(playbackHeartbeatTimer);
       playbackHeartbeatTimer = 0;
     }
+
+    releasePlaybackOwner();
     announcePlayback("idle");
   }
 
@@ -342,6 +432,7 @@
     virtualPausePosition = 0;
     virtualPauseOriginalMuted = false;
     virtualPauseOriginalVolume = 1;
+    resumeSeekTarget = null;
   }
 
   function dispatchPlaybackState() {
@@ -353,6 +444,18 @@
       media instanceof HTMLMediaElement &&
       !media.ended &&
       !!(media.currentSrc || media.src)
+    );
+  }
+
+  function mediaActuallyPlaying(media = activeMedia) {
+    return mediaHasSource(media) && !media.paused;
+  }
+
+  function capturePendingFor(key = pendingReadKey) {
+    return (
+      !!key &&
+      pendingReadKey === key &&
+      !!(captureHook || captureTimeout)
     );
   }
 
@@ -418,20 +521,69 @@
     releaseAutoReadLock();
   }
 
+  function seekResumeTarget(media, target, restoreMuted, restoreVolume) {
+    const deadline = performance.now() + 10000;
+
+    const finish = () => {
+      if (activeMedia !== media) return;
+
+      try {
+        media.defaultPlaybackRate = settings.playbackRate;
+        media.playbackRate = settings.playbackRate;
+        media.muted = restoreMuted;
+        media.volume = restoreVolume;
+      } catch {}
+
+      resumeSeekTarget = null;
+      virtualPaused = false;
+      virtualPausePosition = 0;
+      virtualPauseOriginalMuted = false;
+      virtualPauseOriginalVolume = 1;
+      dispatchPlaybackState();
+    };
+
+    const trySeek = () => {
+      if (activeMedia !== media) return;
+
+      try {
+        let canSeek = false;
+
+        if (media.seekable?.length) {
+          const start = media.seekable.start(0);
+          const end = media.seekable.end(media.seekable.length - 1);
+
+          if (target >= start && target <= end) {
+            media.currentTime = target;
+            canSeek = true;
+          }
+        } else if (Number.isFinite(media.duration) && media.duration > target) {
+          media.currentTime = target;
+          canSeek = true;
+        }
+
+        if (
+          canSeek ||
+          performance.now() >= deadline
+        ) {
+          if (!canSeek) {
+            try {
+              media.currentTime = Math.max(0, target);
+            } catch {}
+          }
+
+          finish();
+          return;
+        }
+      } catch {}
+
+      window.setTimeout(trySeek, 100);
+    };
+
+    trySeek();
+  }
+
   function adoptReadMedia(media, key = pendingReadKey, row = pendingReadRow) {
     if (!(media instanceof HTMLMediaElement)) return;
-
-    // ChatGPT can replace its detached streaming <audio> while Flow is paused.
-    // v0.5.7 cleared the logical pause during that handoff, which caused the
-    // inconsistent first/second/third click behavior. Preserve pause state.
-    const preservePause =
-      virtualPaused &&
-      activeMedia instanceof HTMLMediaElement &&
-      activeMedia !== media;
-
-    if (activeMedia && activeMedia !== media && !preservePause) {
-      clearVirtualPause();
-    }
 
     activeMedia = media;
     activeReadKey = key || activeReadKey;
@@ -442,24 +594,24 @@
     try {
       media.defaultPlaybackRate = settings.playbackRate;
       media.playbackRate = settings.playbackRate;
-
-      if (preservePause || virtualPaused) {
-        media.muted = true;
-        media.volume = 0;
-
-        if (!media.paused) {
-          nativeMediaPause.call(media);
-        }
-
-        if (Number.isFinite(virtualPausePosition)) {
-          try {
-            media.currentTime = virtualPausePosition;
-          } catch {}
-        }
-      }
     } catch {}
 
-    if (!media.__chatgptFlowV059Lifecycle) {
+    if (Number.isFinite(resumeSeekTarget)) {
+      const target = Math.max(0, resumeSeekTarget);
+      const restoreMuted = !!media.muted;
+      const restoreVolume = Number.isFinite(media.volume) ? media.volume : 1;
+
+      try {
+        // Do not let the user hear the replay from zero while waiting for the
+        // streamed TTS range to become seekable to the saved position.
+        media.muted = true;
+        media.volume = 0;
+      } catch {}
+
+      seekResumeTarget(media, target, restoreMuted, restoreVolume);
+    }
+
+    if (!media.__chatgptFlowV0520Lifecycle) {
       media.addEventListener(
         "ended",
         () => {
@@ -469,7 +621,7 @@
       );
 
       try {
-        Object.defineProperty(media, "__chatgptFlowV059Lifecycle", {
+        Object.defineProperty(media, "__chatgptFlowV0520Lifecycle", {
           value: true,
           configurable: true,
         });
@@ -505,24 +657,87 @@
     capturePreviousPlay = previousPlay;
     captureHook = hook;
     HTMLMediaElement.prototype.play = hook;
-    captureTimeout = window.setTimeout(disarmMediaCapture, 10000);
+
+    captureTimeout = window.setTimeout(() => {
+      captureTimeout = 0;
+
+      if (
+        captureHook &&
+        capturePreviousPlay &&
+        HTMLMediaElement.prototype.play === captureHook
+      ) {
+        HTMLMediaElement.prototype.play = capturePreviousPlay;
+      }
+
+      captureHook = null;
+      capturePreviousPlay = null;
+
+      const control = nativeReadButton(
+        pendingReadRow instanceof Element && pendingReadRow.isConnected
+          ? pendingReadRow
+          : activeReadRow,
+      );
+
+      // If ChatGPT never produced/captured media and its own button is back at
+      // Read aloud, startup failed or already ended. Forget the pending start
+      // instead of leaving our custom button stuck on Pause forever.
+      if (
+        pendingReadKey &&
+        !mediaActuallyPlaying(activeMedia) &&
+        !virtualPaused &&
+        !/^Stop reading aloud$/i.test(buttonLabel(control))
+      ) {
+        const staleKey = pendingReadKey;
+        pendingReadKey = "";
+        pendingReadRow = null;
+
+        if (activeReadKey === staleKey) {
+          activeReadKey = "";
+          activeReadRow = null;
+        }
+
+        clearTransportIntent();
+        stopPlaybackHeartbeat();
+        releaseAutoReadLock();
+        dispatchPlaybackState();
+      }
+    }, 10000);
   }
 
   function stopCurrentPlayback() {
-    const media = activeMedia;
-    clearVirtualPause();
+    disarmMediaCapture();
+    clearPauseGuard();
 
-    if (media instanceof HTMLMediaElement && !media.paused) {
-      try {
-        nativeMediaPause.call(media);
-      } catch {}
-    }
+    const row =
+      (activeReadRow instanceof Element && activeReadRow.isConnected
+        ? activeReadRow
+        : resolveEntryByKey(activeReadKey)?.row) || null;
+    const control = nativeReadButton(row);
 
-    clearActiveMedia(media);
+    try {
+      if (
+        isUsableButton(control) &&
+        /^Stop reading aloud$/i.test(buttonLabel(control))
+      ) {
+        nativeButtonClick.call(control);
+      } else if (
+        activeMedia instanceof HTMLMediaElement &&
+        !activeMedia.paused
+      ) {
+        nativeMediaPause.call(activeMedia);
+      }
+    } catch {}
+
+    clearActiveMedia(activeMedia);
   }
 
   function startReadEntry(entry) {
-    if (!settings.enabled || !entry || !isUsableButton(entry.read)) {
+    if (
+      !settings.enabled ||
+      !entry ||
+      !isUsableButton(entry.read) ||
+      !/^Read aloud$/i.test(buttonLabel(entry.read))
+    ) {
       return false;
     }
 
@@ -535,6 +750,7 @@
     }
 
     armMediaCapture(entry.key, entry.row);
+    startPlaybackHeartbeat();
 
     try {
       nativeButtonClick.call(entry.read);
@@ -544,6 +760,7 @@
       disarmMediaCapture();
       pendingReadKey = "";
       pendingReadRow = null;
+      stopPlaybackHeartbeat();
       return false;
     }
   }
@@ -555,134 +772,221 @@
   }
 
   function beginVirtualPause() {
-    if (!mediaHasSource(activeMedia)) return false;
-    if (virtualPaused) return true;
+    const row =
+      (activeReadRow instanceof Element && activeReadRow.isConnected
+        ? activeReadRow
+        : resolveEntryByKey(activeReadKey)?.row) || null;
+    const control = nativeReadButton(row);
 
-    virtualPausePosition = Number.isFinite(activeMedia.currentTime)
-      ? activeMedia.currentTime
-      : 0;
-    virtualPauseOriginalMuted = !!activeMedia.muted;
-    virtualPauseOriginalVolume = Number.isFinite(activeMedia.volume)
-      ? activeMedia.volume
-      : 1;
+    if (
+      !activeReadKey ||
+      !isUsableButton(control) ||
+      !/^Stop reading aloud$/i.test(buttonLabel(control))
+    ) {
+      return false;
+    }
+
+    virtualPausePosition = mediaHasSource(activeMedia)
+      ? Number(activeMedia.currentTime || 0)
+      : virtualPausePosition;
+
     virtualPaused = true;
+    resumeSeekTarget = null;
+
+    // Critical: no HTMLMediaElement.prototype.play guard and no direct
+    // media.pause(). Let ChatGPT tear down its own stream cleanly.
+    disarmMediaCapture();
+    pendingReadKey = "";
+    pendingReadRow = null;
+    clearPauseGuard();
 
     try {
-      disarmMediaCapture();
-      clearPauseGuard();
-
-      // ChatGPT may call play() again immediately after a real pause, or even
-      // replace the detached TTS <audio>. While Flow is paused, block every
-      // detached Read-aloud play() attempt and keep the newest such object.
-      const previousPlay = HTMLMediaElement.prototype.play;
-      const guard = function (...args) {
-        if (virtualPaused && looksLikeReadAloudMedia(this)) {
-          if (activeMedia !== this) {
-            adoptReadMedia(this, activeReadKey, activeReadRow);
-          }
-
-          try {
-            this.muted = true;
-            this.volume = 0;
-            if (!this.paused) nativeMediaPause.call(this);
-            if (Number.isFinite(virtualPausePosition)) {
-              this.currentTime = virtualPausePosition;
-            }
-          } catch {}
-
-          return Promise.resolve();
-        }
-
-        return previousPlay.apply(this, args);
-      };
-
-      pauseGuardPreviousPlay = previousPlay;
-      pauseGuardHook = guard;
-      HTMLMediaElement.prototype.play = guard;
-
-      // Pause the concrete media now, then keep enforcing the paused position.
-      activeMedia.muted = true;
-      activeMedia.volume = 0;
-      nativeMediaPause.call(activeMedia);
-      activeMedia.currentTime = virtualPausePosition;
-
-      virtualPauseTimer = window.setInterval(() => {
-        if (!virtualPaused || !mediaHasSource(activeMedia)) return;
-
-        try {
-          activeMedia.muted = true;
-          activeMedia.volume = 0;
-
-          if (!activeMedia.paused) {
-            nativeMediaPause.call(activeMedia);
-          }
-
-          if (
-            Number.isFinite(virtualPausePosition) &&
-            Math.abs(activeMedia.currentTime - virtualPausePosition) > 0.015
-          ) {
-            activeMedia.currentTime = virtualPausePosition;
-          }
-        } catch {}
-      }, 35);
-
+      flowInitiatedNativeStop = true;
+      nativeButtonClick.call(control);
+      activeMedia = null;
+      stopPlaybackHeartbeat();
       dispatchPlaybackState();
       return true;
     } catch (error) {
-      clearVirtualPause();
+      virtualPaused = false;
       log("Pause failed:", error);
+      dispatchPlaybackState();
       return false;
+    } finally {
+      // The click event is dispatched synchronously by HTMLElement.click().
+      // Clear after the native handler + our capture listener have seen it.
+      queueMicrotask(() => {
+        flowInitiatedNativeStop = false;
+      });
     }
   }
 
   function resumeVirtualPause() {
-    if (!virtualPaused || !mediaHasSource(activeMedia)) return false;
+    if (!virtualPaused || !activeReadKey) return false;
 
-    const resumeAt = virtualPausePosition;
-    const restoreMuted = virtualPauseOriginalMuted;
-    const restoreVolume = virtualPauseOriginalVolume;
-    const resumePlay = pauseGuardPreviousPlay || HTMLMediaElement.prototype.play;
+    const entry = resolveEntryByKey(activeReadKey);
+    if (
+      !entry ||
+      !isUsableButton(entry.read) ||
+      !/^Read aloud$/i.test(buttonLabel(entry.read))
+    ) {
+      return false;
+    }
+
+    resumeSeekTarget = Math.max(0, Number(virtualPausePosition) || 0);
+    activeReadRow = entry.row;
+
+    armMediaCapture(entry.key, entry.row);
+    startPlaybackHeartbeat();
 
     try {
-      if (virtualPauseTimer) {
-        clearInterval(virtualPauseTimer);
-        virtualPauseTimer = 0;
-      }
-
-      clearPauseGuard();
-
-      if (Number.isFinite(resumeAt)) activeMedia.currentTime = resumeAt;
-      activeMedia.muted = restoreMuted;
-      activeMedia.volume = restoreVolume;
-      activeMedia.defaultPlaybackRate = settings.playbackRate;
-      activeMedia.playbackRate = settings.playbackRate;
-
+      nativeButtonClick.call(entry.read);
       virtualPaused = false;
-      virtualPausePosition = 0;
-      virtualPauseOriginalMuted = false;
-      virtualPauseOriginalVolume = 1;
-
-      if (activeMedia.paused) {
-        const result = resumePlay.apply(activeMedia, []);
-        result?.catch?.((error) => log("Resume play failed:", error));
-      }
-
       dispatchPlaybackState();
       return true;
     } catch (error) {
+      disarmMediaCapture();
+      resumeSeekTarget = null;
+      virtualPaused = true;
+      stopPlaybackHeartbeat();
       log("Resume failed:", error);
+      dispatchPlaybackState();
       return false;
     }
+  }
+
+  function clearTransportIntent() {
+    if (transportIntentTimer) {
+      clearTimeout(transportIntentTimer);
+      transportIntentTimer = 0;
+    }
+    transportIntent = null;
+  }
+
+  function scheduleTransportIntent(delay = 45) {
+    if (!transportIntent || transportIntentTimer) return;
+    transportIntentTimer = window.setTimeout(() => {
+      transportIntentTimer = 0;
+      serviceTransportIntent();
+    }, delay);
+  }
+
+  function serviceTransportIntent() {
+    const intent = transportIntent;
+    if (!intent) return false;
+
+    if (performance.now() >= intent.deadline) {
+      const row =
+        intent.row instanceof Element && intent.row.isConnected
+          ? intent.row
+          : resolveEntryByKey(intent.key)?.row || null;
+
+      clearTransportIntent();
+
+      if (row) {
+        reconcileRowPlayback(row, intent.key);
+      }
+
+      dispatchPlaybackState();
+      return false;
+    }
+
+    const row =
+      intent.row instanceof Element && intent.row.isConnected
+        ? intent.row
+        : resolveEntryByKey(intent.key)?.row || null;
+
+    const control = nativeReadButton(row);
+    const currentLabel = buttonLabel(control);
+
+    if (
+      intent.type === "pause" &&
+      isUsableButton(control) &&
+      /^Stop reading aloud$/i.test(currentLabel)
+    ) {
+      clearTransportIntent();
+      activeReadRow = row;
+      return beginVirtualPause();
+    }
+
+    if (
+      intent.type === "resume" &&
+      isUsableButton(control) &&
+      /^Read aloud$/i.test(currentLabel)
+    ) {
+      clearTransportIntent();
+      activeReadRow = row;
+      return resumeVirtualPause();
+    }
+
+    scheduleTransportIntent();
+    return true;
+  }
+
+  function requestTransport(type, row, key) {
+    clearTransportIntent();
+    transportIntent = {
+      type,
+      row,
+      key,
+      deadline: performance.now() + 3000,
+    };
+    dispatchPlaybackState();
+    serviceTransportIntent();
+    return true;
   }
 
   function rowKey(row) {
     return entryForRow(row)?.key || "";
   }
 
+  function reconcileRowPlayback(row, key = rowKey(row)) {
+    if (!key) return;
+
+    const control = nativeReadButton(row);
+    const nativeLabel = buttonLabel(control);
+    const pending = capturePendingFor(key);
+
+    // The diagnostic showed the broken state exactly as:
+    // native = Read aloud, custom = Pause, controller.active = true.
+    // In that state ChatGPT itself is idle, there is no playing media and no
+    // live capture. Any active/pending/transport state is stale and must be
+    // discarded before interpreting the next click.
+    if (
+      activeReadKey === key &&
+      !virtualPaused &&
+      !mediaActuallyPlaying(activeMedia) &&
+      !pending &&
+      !/^Stop reading aloud$/i.test(nativeLabel)
+    ) {
+      pendingReadKey = "";
+      pendingReadRow = null;
+      activeReadKey = "";
+      activeReadRow = null;
+
+      if (transportIntent?.key === key) {
+        clearTransportIntent();
+      }
+
+      stopPlaybackHeartbeat();
+      releaseAutoReadLock();
+    }
+  }
+
   function rowMatchesActive(row, key = rowKey(row)) {
+    if (!key) return false;
+
+    reconcileRowPlayback(row, key);
+
     return (
-      mediaHasSource(activeMedia) &&
-      (!!key && (row === activeReadRow || key === activeReadKey))
+      key === activeReadKey &&
+      (
+        virtualPaused ||
+        mediaActuallyPlaying(activeMedia) ||
+        capturePendingFor(key) ||
+        transportIntent?.key === key ||
+        /^Stop reading aloud$/i.test(buttonLabel(nativeReadButton(row)))
+      )
     );
   }
 
@@ -690,24 +994,36 @@
     const key = rowKey(row);
     if (!key) return false;
 
-    const mediaActive = mediaHasSource(activeMedia);
-    const sameResponse = mediaActive && activeReadKey === key;
+    reconcileRowPlayback(row, key);
 
-    // The v0.5.8 bug was here: any stale paused TTS object in the tab was
-    // treated as the media for whichever row the user clicked. That made the
-    // first click resume/pause an older answer and left the visible button on
-    // Play. Only control media that belongs to this exact assistant response.
-    if (sameResponse) {
+    const sameResponse = !!activeReadKey && activeReadKey === key;
+    const nativeLabel = buttonLabel(nativeReadButton(row));
+    const startingThisResponse = capturePendingFor(key);
+
+    if (sameResponse && virtualPaused) {
       activeReadRow = row;
-      return virtualPaused ? resumeVirtualPause() : beginVirtualPause();
+      return requestTransport("resume", row, key);
     }
 
-    // A different response owns the remembered media. Stop and forget it
-    // before starting the requested row; never inherit its pause state.
-    if (mediaActive || virtualPaused || activeReadKey) {
+    if (
+      sameResponse &&
+      (
+        startingThisResponse ||
+        mediaActuallyPlaying(activeMedia) ||
+        /^Stop reading aloud$/i.test(nativeLabel)
+      )
+    ) {
+      activeReadRow = row;
+      return requestTransport("pause", row, key);
+    }
+
+    if (activeReadKey && activeReadKey !== key) {
+      clearTransportIntent();
       stopCurrentPlayback();
     }
 
+    // Native Read aloud + no live media means Play, even if an older capture
+    // attempt left bookkeeping behind.
     clearPendingAutoRead();
     markAutoReadHandled(key);
     return startReadForRow(row);
@@ -792,14 +1108,11 @@
 
   function playbackStateForRow(row) {
     const key = rowKey(row);
-    const mediaActive = mediaHasSource(activeMedia);
     const matched = rowMatchesActive(row, key);
 
     return {
-      // Pause/Play state belongs to one exact assistant response. A stale media
-      // object from another response must never make this row look paused.
-      active: mediaActive && matched,
-      paused: mediaActive && matched && virtualPaused,
+      active: matched,
+      paused: matched && virtualPaused,
       rate: settings.playbackRate,
     };
   }
@@ -835,8 +1148,9 @@
       return;
     }
 
-    if (mediaHasSource(activeMedia) || otherTabPlaybackActive()) {
-      retry();
+    if (localPlaybackLooksActive() || otherTabPlaybackActive()) {
+      markAutoReadHandled(key);
+      log("Auto-read skipped because another message is already playing");
       return;
     }
 
@@ -859,8 +1173,9 @@
         return;
       }
 
-      if (mediaHasSource(activeMedia) || otherTabPlaybackActive()) {
-        retry();
+      if (localPlaybackLooksActive() || otherTabPlaybackActive()) {
+        markAutoReadHandled(key);
+        log("Auto-read skipped because another message is already playing");
         return;
       }
 
@@ -1239,7 +1554,36 @@
           clearPendingAutoRead();
           markAutoReadHandled(entry.key);
           armMediaCapture(entry.key, entry.row);
+          startPlaybackHeartbeat();
         }
+        return;
+      }
+
+      if (/^Stop reading aloud$/i.test(label)) {
+        if (flowInitiatedNativeStop) {
+          // Flow Pause deliberately keeps activeReadKey + saved position so the
+          // next custom click can restart native Read aloud and seek back.
+          return;
+        }
+
+        // Genuine user/native Stop: forget Flow playback state completely so
+        // the next native Read aloud starts from a clean state.
+        window.setTimeout(() => {
+          clearTransportIntent();
+          disarmMediaCapture();
+          clearPauseGuard();
+          activeMedia = null;
+          activeReadKey = "";
+          activeReadRow = null;
+          pendingReadKey = "";
+          pendingReadRow = null;
+          virtualPaused = false;
+          virtualPausePosition = 0;
+          resumeSeekTarget = null;
+          stopPlaybackHeartbeat();
+          releaseAutoReadLock();
+          dispatchPlaybackState();
+        }, 0);
         return;
       }
 
@@ -1371,6 +1715,9 @@
     cycleSpeed() {
       cyclePlaybackRate();
     },
+    setSpeed(rate) {
+      setPlaybackRate(rate, true);
+    },
     state(row) {
       return playbackStateForRow(row);
     },
@@ -1383,6 +1730,7 @@
     () => {
       mutationObserver.disconnect();
       if (responsePollTimer) clearInterval(responsePollTimer);
+      clearTransportIntent();
       clearPendingAutoRead();
       clearSilenceSession();
       disarmMediaCapture();
@@ -1401,5 +1749,5 @@
     "*",
   );
 
-  log("v0.5.5 unified controller loaded");
+  log("v0.5.20 stale playback-state reconciliation loaded");
 })();
