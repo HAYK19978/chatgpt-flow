@@ -1,10 +1,11 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Flow",
-  "version": "0.4.7",
-  "description": "Hands-free ChatGPT dictation with silence auto-send, automatic Read aloud, message-bound playback controls, exact 15-second seek, virtual pause, and live speed control.",
+  "version": "0.5.9",
+  "description": "Hands-free ChatGPT workflow with silence auto-send, response-ready sound, single cross-tab automatic Read aloud, response-scoped play/pause/resume, fine seek controls and speed control.",
   "permissions": [
-    "storage"
+    "storage",
+    "offscreen"
   ],
   "icons": {
     "16": "icons/icon16.png",
@@ -39,11 +40,14 @@
         "https://chat.openai.com/*"
       ],
       "js": [
-        "flow-main.js",
+        "flow-features.js",
         "flow-ui.js"
       ],
       "run_at": "document_start",
       "world": "MAIN"
     }
-  ]
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
 }

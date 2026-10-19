@@ -1,92 +1,83 @@
 (() => {
   "use strict";
 
-  const SETTINGS_KEY = "chatgptFlowSettings";
-  const DEFAULT_SETTINGS = {
+  const KEY = "chatgptFlowSettings";
+  const DEFAULTS = {
     enabled: true,
+    autoSendEnabled: true,
     silenceMs: 5000,
+    autoReadEnabled: true,
+    autoReadDelayMs: 0,
+    readySoundEnabled: false,
+    resumePlaybackEnabled: true,
     playbackRate: 1,
   };
 
-  const enabledInput = document.querySelector("#flow-enabled");
-  const silenceInput = document.querySelector("#silence-seconds");
-  const playbackRateInput = document.querySelector("#playback-rate");
-  const statusText = document.querySelector("#status-text");
+  const $ = (selector) => document.querySelector(selector);
+  const enabled = $("#flow-enabled");
+  const autoSend = $("#auto-send-enabled");
+  const silence = $("#silence-seconds");
+  const autoRead = $("#auto-read-enabled");
+  const delay = $("#auto-read-delay");
+  const readySound = $("#ready-sound-enabled");
+  const rate = $("#playback-rate");
+  const status = $("#status-text");
 
-  function clampSeconds(value) {
-    const numeric = Number(value);
+  const clampInt = (value, min, max, fallback) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : fallback;
+  };
 
-    if (!Number.isFinite(numeric)) return 5;
+  const clampRate = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(2, Math.max(0.5, Math.round(n * 4) / 4)) : 1;
+  };
 
-    return Math.min(90, Math.max(2, Math.round(numeric)));
-  }
-
-  function clampPlaybackRate(value) {
-    const numeric = Number(value);
-
-    if (!Number.isFinite(numeric)) return 1;
-
-    return Math.min(2, Math.max(0.5, Math.round(numeric * 4) / 4));
+  function render() {
+    status.textContent = enabled.checked ? "Flow включён" : "Flow выключен";
+    document.body.classList.toggle("disabled", !enabled.checked);
+    silence.disabled = !autoSend.checked;
+    delay.disabled = !autoRead.checked;
   }
 
   async function load() {
-    const stored = await chrome.storage.local.get({
-      [SETTINGS_KEY]: DEFAULT_SETTINGS,
-    });
+    const result = await chrome.storage.local.get({ [KEY]: DEFAULTS });
+    const settings = result[KEY] || DEFAULTS;
 
-    const settings = stored[SETTINGS_KEY] || DEFAULT_SETTINGS;
-
-    enabledInput.checked = settings.enabled !== false;
-
-    silenceInput.value = String(
-      clampSeconds((Number(settings.silenceMs) || 5000) / 1000),
-    );
-
-    playbackRateInput.value = String(
-      clampPlaybackRate(settings.playbackRate),
-    );
-
-    renderStatus();
-  }
-
-  function renderStatus() {
-    statusText.textContent = enabledInput.checked
-      ? "Flow включён"
-      : "Flow выключен";
+    enabled.checked = settings.enabled !== false;
+    autoSend.checked = settings.autoSendEnabled !== false;
+    silence.value = String(clampInt((Number(settings.silenceMs) || 5000) / 1000, 2, 90, 5));
+    autoRead.checked = settings.autoReadEnabled !== false;
+    delay.value = String(clampInt((Number(settings.autoReadDelayMs) || 0) / 1000, 0, 30, 0));
+    readySound.checked = settings.readySoundEnabled === true;
+    rate.value = String(clampRate(settings.playbackRate));
+    render();
   }
 
   async function save() {
-    const seconds = clampSeconds(silenceInput.value);
+    const silenceSeconds = clampInt(silence.value, 2, 90, 5);
+    const delaySeconds = clampInt(delay.value, 0, 30, 0);
+    silence.value = String(silenceSeconds);
+    delay.value = String(delaySeconds);
 
-    silenceInput.value = String(seconds);
-
+    const current = (await chrome.storage.local.get({ [KEY]: DEFAULTS }))[KEY] || DEFAULTS;
     await chrome.storage.local.set({
-      [SETTINGS_KEY]: {
-        enabled: enabledInput.checked,
-        silenceMs: seconds * 1000,
-        playbackRate: clampPlaybackRate(playbackRateInput.value),
+      [KEY]: {
+        ...current,
+        enabled: enabled.checked,
+        autoSendEnabled: autoSend.checked,
+        silenceMs: silenceSeconds * 1000,
+        autoReadEnabled: autoRead.checked,
+        autoReadDelayMs: delaySeconds * 1000,
+        readySoundEnabled: readySound.checked,
+        playbackRate: clampRate(rate.value),
       },
     });
-
-    renderStatus();
+    render();
   }
 
-  enabledInput.addEventListener("change", () => {
-    save().catch(console.error);
-  });
-
-  silenceInput.addEventListener("change", () => {
-    save().catch(console.error);
-  });
-
-  playbackRateInput.addEventListener("change", () => {
-    save().catch(console.error);
-  });
-
-  silenceInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      silenceInput.blur();
-    }
+  [enabled, autoSend, silence, autoRead, delay, readySound, rate].forEach((element) => {
+    element.addEventListener("change", () => save().catch(console.error));
   });
 
   load().catch(console.error);

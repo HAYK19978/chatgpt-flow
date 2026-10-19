@@ -1,59 +1,7 @@
-<!doctype html>
-<html lang="ru">
-
-<head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>ChatGPT Flow</title>
-    <link rel="stylesheet" href="popup.css" />
-</head>
-
-<body>
-    <main class="panel">
-        <header class="header">
-            <div>
-                <h1>ChatGPT Flow</h1>
-                <p id="status-text">Flow включён</p>
-            </div>
-
-            <label class="switch" aria-label="Включить или выключить ChatGPT Flow">
-                <input id="flow-enabled" type="checkbox" />
-                <span class="slider"></span>
-            </label>
-        </header>
-
-        <section class="setting">
-            <div class="setting-copy">
-                <label for="silence-seconds">Отправка после тишины</label>
-                <span>От двух до девяноста секунд</span>
-            </div>
-
-            <div class="number-wrap">
-                <input id="silence-seconds" type="number" min="2" max="90" step="1" inputmode="numeric" />
-                <span>сек</span>
-            </div>
-        </section>
-
-        <section class="setting">
-            <div class="setting-copy">
-                <label for="playback-rate">Скорость Read aloud</label>
-                <span>Сохраняется для следующих сообщений</span>
-            </div>
-
-            <div class="number-wrap">
-                <select id="playback-rate" aria-label="Скорость Read aloud">
-                    <option value="0.75">0.75×</option>
-                    <option value="1">1×</option>
-                    <option value="1.25">1.25×</option>
-                    <option value="1.5">1.5×</option>
-                    <option value="1.75">1.75×</option>
-                    <option value="2">2×</option>
-                </select>
-            </div>
-        </section>
-    </main>
-
-    <script src="popup.js"></script>
-</body>
-
-</html>
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ChatGPT Flow</title><link rel="stylesheet" href="popup.css"></head><body><main class="panel">
+<header class="header"><div><h1>ChatGPT Flow</h1><p id="status-text">Flow включён</p></div><label class="switch"><input id="flow-enabled" type="checkbox"><span class="slider"></span></label></header>
+<section class="setting"><div class="setting-copy"><label>Автоотправка после тишины</label><span>От 2 до 90 секунд</span></div><div class="controls"><label class="switch small"><input id="auto-send-enabled" type="checkbox"><span class="slider"></span></label><div class="number-wrap"><input id="silence-seconds" type="number" min="2" max="90" step="1"><span>сек</span></div></div></section>
+<section class="setting"><div class="setting-copy"><label>Автопрослушивание ответа</label><span>Запустить Read aloud после готовности</span></div><div class="controls"><label class="switch small"><input id="auto-read-enabled" type="checkbox"><span class="slider"></span></label><div class="number-wrap"><input id="auto-read-delay" type="number" min="0" max="30" step="1"><span>сек</span></div></div></section>
+<section class="setting"><div class="setting-copy"><label>Звук готового ответа</label><span>sounds/done.mp3</span></div><label class="switch small"><input id="ready-sound-enabled" type="checkbox"><span class="slider"></span></label></section>
+<section class="setting"><div class="setting-copy"><label for="playback-rate">Скорость Read aloud</label><span>Сохраняется для следующих сообщений</span></div><div class="number-wrap"><select id="playback-rate"><option value="0.75">0.75×</option><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="1.75">1.75×</option><option value="2">2×</option></select></div></section>
+</main><script src="popup.js"></script></body></html>
