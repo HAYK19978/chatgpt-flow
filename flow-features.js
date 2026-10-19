@@ -1,8 +1,8 @@
 (() => {
   "use strict";
 
-  if (window.__CHATGPT_FLOW_CONTROLLER_V0520__) return;
-  window.__CHATGPT_FLOW_CONTROLLER_V0520__ = true;
+  if (window.__CHATGPT_FLOW_CONTROLLER_V0523__) return;
+  window.__CHATGPT_FLOW_CONTROLLER_V0523__ = true;
 
   const READ_SELECTOR = 'button[aria-label="Read aloud"]';
   const TRANSCRIBE_SELECTOR = 'button[aria-label="Transcribe and send"]';
@@ -50,6 +50,7 @@
   // Dictation / silence monitor.
   let lastMicStream = null;
   let silenceSession = null;
+  let silenceRestartBlockedUntil = 0;
 
   // Read-aloud media state.
   let pendingReadKey = "";
@@ -91,6 +92,8 @@
   let captureHook = null;
   let capturePreviousPlay = null;
   let captureTimeout = 0;
+  let activeMediaStartingUntil = 0;
+  let activeMediaStartTimer = 0;
 
   // Cross-tab playback coordination and auto-read lock.
   let autoReadRelease = null;
@@ -116,6 +119,25 @@
       button.isConnected &&
       !button.disabled &&
       button.getAttribute("aria-disabled") !== "true"
+    );
+  }
+
+  function findTranscribeAndSendButton() {
+    const exact = document.querySelector(TRANSCRIBE_SELECTOR);
+    if (isUsableButton(exact)) return exact;
+
+    return (
+      [...document.querySelectorAll("button")].find((button) => {
+        if (!isUsableButton(button)) return false;
+
+        const label = buttonLabel(button);
+        const testId = button.getAttribute("data-testid") || "";
+
+        return (
+          /transcrib.*send|send.*transcrib/i.test(label) ||
+          /transcrib.*send|send.*transcrib/i.test(testId)
+        );
+      }) || null
     );
   }
 
@@ -207,19 +229,57 @@
     }
   }
 
+  function turnIdentity(row) {
+    if (!(row instanceof Element)) return "";
+
+    const turn = row.closest(
+      '[data-testid^="conversation-turn-"],[data-turn-id],[data-message-id],article[data-testid],article',
+    );
+
+    if (turn instanceof Element) {
+      for (const name of [
+        "data-message-id",
+        "data-turn-id",
+        "data-testid",
+        "id",
+      ]) {
+        const value = (turn.getAttribute(name) || "").trim();
+        if (value) return `${name}:${value}`;
+      }
+    }
+
+    // ChatGPT can rerender the message body and action controls. The old
+    // implementation keyed a response only by extracted text; when the body
+    // lookup resolved to an older shared ancestor, several different action
+    // rows received the exact same key. resolveEntryByKey() then selected the
+    // first matching old response, producing "random previous message" audio.
+    //
+    // DOM order of assistant action rows is unique even when text extraction
+    // is temporarily ambiguous, and remains stable as new turns append.
+    const rows = [...document.querySelectorAll(ACTION_ROW_SELECTOR)].filter(
+      isAssistantActionRow,
+    );
+    const index = rows.indexOf(row);
+
+    return index >= 0 ? `assistant-row:${index}` : "";
+  }
+
   function entryForRow(row) {
     if (!isAssistantActionRow(row)) return null;
     const read = nativeReadButton(row);
     if (!isUsableButton(read)) return null;
 
+    const identity = turnIdentity(row);
+    if (!identity) return null;
+
     const text = normalizedTurnText(row);
-    if (!text) return null;
 
     return {
       row,
       read,
       text,
-      key: `${location.pathname}::${text}`,
+      identity,
+      key: `${location.pathname}::${identity}`,
     };
   }
 
@@ -246,6 +306,18 @@
       playbackChannel.postMessage({
         tabId: TAB_ID,
         state,
+        at: Date.now(),
+      });
+    } catch {}
+  }
+
+  function requestPlaybackTakeover() {
+    if (!playbackChannel) return;
+
+    try {
+      playbackChannel.postMessage({
+        tabId: TAB_ID,
+        state: "takeover",
         at: Date.now(),
       });
     } catch {}
@@ -335,8 +407,25 @@
 
       if (data.state === "playing") {
         remotePlayback.set(data.tabId, Number(data.at) || Date.now());
-      } else if (data.state === "idle") {
+        return;
+      }
+
+      if (data.state === "idle") {
         remotePlayback.delete(data.tabId);
+        return;
+      }
+
+      if (data.state === "takeover") {
+        remotePlayback.set(data.tabId, Number(data.at) || Date.now());
+
+        if (virtualPaused || !localPlaybackLooksActive()) return;
+
+        // Manual playback in another tab wins. Prefer Flow Pause so this tab
+        // can later resume from its own saved position; fall back to Stop only
+        // if ChatGPT's current native state cannot be paused cleanly.
+        if (!beginVirtualPause()) {
+          stopCurrentPlayback();
+        }
       }
     });
   }
@@ -448,7 +537,13 @@
   }
 
   function mediaActuallyPlaying(media = activeMedia) {
-    return mediaHasSource(media) && !media.paused;
+    return (
+      mediaHasSource(media) &&
+      (
+        !media.paused ||
+        (media === activeMedia && performance.now() < activeMediaStartingUntil)
+      )
+    );
   }
 
   function capturePendingFor(key = pendingReadKey) {
@@ -509,6 +604,12 @@
 
   function clearActiveMedia(media = activeMedia) {
     if (media && activeMedia !== media) return;
+
+    if (activeMediaStartTimer) {
+      clearTimeout(activeMediaStartTimer);
+      activeMediaStartTimer = 0;
+    }
+    activeMediaStartingUntil = 0;
 
     clearVirtualPause({ restoreMuted: false });
     activeMedia = null;
@@ -585,7 +686,13 @@
   function adoptReadMedia(media, key = pendingReadKey, row = pendingReadRow) {
     if (!(media instanceof HTMLMediaElement)) return;
 
+    if (activeMediaStartTimer) {
+      clearTimeout(activeMediaStartTimer);
+      activeMediaStartTimer = 0;
+    }
+
     activeMedia = media;
+    activeMediaStartingUntil = performance.now() + 3000;
     activeReadKey = key || activeReadKey;
     activeReadRow = row || activeReadRow;
     pendingReadKey = "";
@@ -611,7 +718,7 @@
       seekResumeTarget(media, target, restoreMuted, restoreVolume);
     }
 
-    if (!media.__chatgptFlowV0520Lifecycle) {
+    if (!media.__chatgptFlowV0523Lifecycle) {
       media.addEventListener(
         "ended",
         () => {
@@ -621,12 +728,31 @@
       );
 
       try {
-        Object.defineProperty(media, "__chatgptFlowV0520Lifecycle", {
+        Object.defineProperty(media, "__chatgptFlowV0523Lifecycle", {
           value: true,
           configurable: true,
         });
       } catch {}
     }
+
+    activeMediaStartTimer = window.setTimeout(() => {
+      activeMediaStartTimer = 0;
+      activeMediaStartingUntil = 0;
+
+      if (
+        activeMedia === media &&
+        media.paused &&
+        !virtualPaused &&
+        !/^Stop reading aloud$/i.test(
+          buttonLabel(nativeReadButton(activeReadRow)),
+        )
+      ) {
+        clearActiveMedia(media);
+        return;
+      }
+
+      dispatchPlaybackState();
+    }, 3100);
 
     startPlaybackHeartbeat();
     dispatchPlaybackState();
@@ -644,11 +770,27 @@
     const previousPlay = HTMLMediaElement.prototype.play;
 
     const hook = function (...args) {
-      const result = previousPlay.apply(this, args);
+      const media = this;
+      const result = previousPlay.apply(media, args);
 
-      if (looksLikeReadAloudMedia(this)) {
-        adoptReadMedia(this, key, row);
+      if (looksLikeReadAloudMedia(media)) {
+        adoptReadMedia(media, key, row);
         queueMicrotask(disarmMediaCapture);
+
+        Promise.resolve(result).then(
+          () => {
+            if (activeMedia !== media) return;
+            activeMediaStartingUntil = 0;
+            startPlaybackHeartbeat();
+            dispatchPlaybackState();
+          },
+          (error) => {
+            if (activeMedia === media) {
+              log("Read aloud media.play rejected:", error);
+              clearActiveMedia(media);
+            }
+          },
+        );
       }
 
       return result;
@@ -1002,6 +1144,7 @@
 
     if (sameResponse && virtualPaused) {
       activeReadRow = row;
+      requestPlaybackTakeover();
       return requestTransport("resume", row, key);
     }
 
@@ -1026,6 +1169,7 @@
     // attempt left bookkeeping behind.
     clearPendingAutoRead();
     markAutoReadHandled(key);
+    requestPlaybackTakeover();
     return startReadForRow(row);
   }
 
@@ -1400,6 +1544,7 @@
       peakRms: 0,
       lastSampleAt: performance.now(),
       lastSpeechAt: 0,
+      quietSince: 0,
       sending: false,
     };
 
@@ -1431,40 +1576,67 @@
       session.lastSampleAt = now;
       session.peakRms = Math.max(session.peakRms, level);
 
-      const threshold = Math.max(0.0015, session.noiseFloor * 2.2);
-      const tailThreshold = Math.max(0.00055, session.noiseFloor * 1.35);
-      const voice = level > (session.speechConfirmed ? tailThreshold : threshold);
+      const startThreshold = Math.max(
+        0.0012,
+        session.noiseFloor * 1.8,
+      );
 
       if (!session.speechConfirmed) {
+        const voice = level > startThreshold;
+
         if (voice) {
           session.speechEvidenceMs += delta;
         } else {
           session.speechEvidenceMs = Math.max(
             0,
-            session.speechEvidenceMs - delta * 0.4,
+            session.speechEvidenceMs - delta * 0.35,
           );
 
-          if (level < Math.max(0.008, threshold * 1.3)) {
+          if (level < Math.max(0.008, startThreshold * 1.4)) {
             session.noiseFloor =
               session.noiseFloor * 0.97 + level * 0.03;
           }
         }
 
         if (
-          session.speechEvidenceMs >= 120 ||
-          (session.peakRms >= 0.003 && session.speechEvidenceMs >= 80)
+          session.speechEvidenceMs >= 100 ||
+          (session.peakRms >= 0.0025 && session.speechEvidenceMs >= 60)
         ) {
           session.speechConfirmed = true;
           session.lastSpeechAt = now;
+          session.quietSince = 0;
           log("Speech detected");
         }
 
         return;
       }
 
+      // After speech is confirmed, use a noticeably stronger threshold than
+      // the old 1.35× noise-floor tail. The old threshold was so sensitive
+      // that ordinary room/microphone noise could be classified as speech
+      // forever, which explains intermittent "3 seconds passed, no send".
+      const tailThreshold = Math.max(
+        0.0016,
+        session.noiseFloor * 2.0,
+        Math.min(0.006, session.peakRms * 0.12),
+      );
+
+      const voice = level > tailThreshold;
+
       if (voice) {
         session.lastSpeechAt = now;
+        session.quietSince = 0;
         return;
+      }
+
+      if (!session.quietSince) {
+        session.quietSince = now;
+      }
+
+      // Keep adapting the noise floor while the input is genuinely quiet.
+      if (level < tailThreshold * 0.85) {
+        session.noiseFloor =
+          session.noiseFloor * 0.985 + level * 0.015;
       }
 
       const silenceMs = Math.max(
@@ -1472,19 +1644,16 @@
         Math.min(90000, Number(settings.silenceMs) || 5000),
       );
 
-      // Give the end of a spoken phrase a little hysteresis. This protects
-      // quieter final syllables from being treated as silence several seconds
-      // before the user actually stopped talking.
-      const effectiveLastSpeechAt = session.lastSpeechAt + 250;
-      if (now - effectiveLastSpeechAt < silenceMs) return;
+      if (now - session.quietSince < silenceMs) return;
 
-      const button = document.querySelector(TRANSCRIBE_SELECTOR);
+      const button = findTranscribeAndSendButton();
       if (!isUsableButton(button)) {
         // Keep monitoring. The native send button can appear a fraction later.
         return;
       }
 
       session.sending = true;
+      silenceRestartBlockedUntil = performance.now() + 2000;
       armForResponse();
       log(`Silence timeout ${silenceMs}ms; clicking Transcribe and send`);
 
@@ -1502,6 +1671,7 @@
 
   function restartSilenceMonitorIfPossible() {
     if (
+      performance.now() >= silenceRestartBlockedUntil &&
       settings.enabled &&
       settings.autoSendEnabled &&
       streamHasLiveAudio(lastMicStream)
@@ -1530,6 +1700,23 @@
     };
   }
 
+  function ensureSilenceMonitorForActiveDictation() {
+    if (
+      !settings.enabled ||
+      !settings.autoSendEnabled ||
+      silenceSession ||
+      performance.now() < silenceRestartBlockedUntil ||
+      !streamHasLiveAudio(lastMicStream) ||
+      !findTranscribeAndSendButton()
+    ) {
+      return;
+    }
+
+    startSilenceMonitor(lastMicStream).catch((error) =>
+      log("Could not recover silence monitor:", error),
+    );
+  }
+
   // ---------------------------------------------------------------------------
   // User actions / settings / observers
   // ---------------------------------------------------------------------------
@@ -1551,6 +1738,10 @@
         const row = button.closest(ACTION_ROW_SELECTOR);
         const entry = entryForRow(row);
         if (entry) {
+          if (event.isTrusted) {
+            requestPlaybackTakeover();
+          }
+
           clearPendingAutoRead();
           markAutoReadHandled(entry.key);
           armMediaCapture(entry.key, entry.row);
@@ -1600,11 +1791,13 @@
           label,
         )
       ) {
+        silenceRestartBlockedUntil = performance.now() + 2000;
         clearSilenceSession();
         return;
       }
 
       if (/^Transcribe and send$/i.test(label)) {
+        silenceRestartBlockedUntil = performance.now() + 2000;
         clearSilenceSession();
         if (settings.enabled) armForResponse();
         return;
@@ -1685,11 +1878,13 @@
 
     if (!settings.autoReadEnabled) {
       clearPendingAutoRead();
+      releaseAutoReadLock();
     }
   });
 
   const mutationObserver = new MutationObserver(() => {
     pollResponseState();
+    ensureSilenceMonitorForActiveDictation();
   });
 
   mutationObserver.observe(document.documentElement, {
@@ -1697,13 +1892,17 @@
     subtree: true,
   });
 
-  responsePollTimer = window.setInterval(pollResponseState, 250);
+  responsePollTimer = window.setInterval(() => {
+    pollResponseState();
+    ensureSilenceMonitorForActiveDictation();
+  }, 250);
 
   window.__CHATGPT_FLOW_CONTROLLER__ = {
     toggle(row) {
       return toggleForRow(row);
     },
     start(row) {
+      requestPlaybackTakeover();
       return startReadForRow(row);
     },
     seekBack(row) {
@@ -1749,5 +1948,5 @@
     "*",
   );
 
-  log("v0.5.20 stale playback-state reconciliation loaded");
+  log("v0.5.23 cross-tab takeover + sound retry loaded");
 })();
