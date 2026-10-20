@@ -70,6 +70,18 @@ async function playReadySoundReliable() {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === "chatgpt-flow-update-settings") {
+    chrome.storage.local
+      .set({ chatgptFlowSettings: message.settings || {} })
+      .then(() => sendResponse({ ok: true }))
+      .catch((error) => {
+        console.error("[ChatGPT Flow] Settings save failed:", error);
+        sendResponse({ ok: false, error: String(error) });
+      });
+
+    return true;
+  }
+
   if (message?.type !== "chatgpt-flow-play-ready-sound") return;
 
   playReadySoundReliable()

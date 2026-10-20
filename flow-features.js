@@ -1,8 +1,8 @@
 (() => {
   "use strict";
 
-  if (window.__CHATGPT_FLOW_CONTROLLER_V0523__) return;
-  window.__CHATGPT_FLOW_CONTROLLER_V0523__ = true;
+  if (window.__CHATGPT_FLOW_CONTROLLER_V0526__) return;
+  window.__CHATGPT_FLOW_CONTROLLER_V0526__ = true;
 
   const READ_SELECTOR = 'button[aria-label="Read aloud"]';
   const TRANSCRIBE_SELECTOR = 'button[aria-label="Transcribe and send"]';
@@ -47,10 +47,33 @@
   let pendingAutoReadTimer = 0;
   let responsePollTimer = 0;
 
+  // Ready handling is deduplicated independently from the send gesture.
+  // ChatGPT can change how a message is submitted (dictation, voice UI,
+  // rerenders, background tabs), so a completed new assistant action row is
+  // also watched as a fallback completion signal.
+  const readyHandledKeys = new Set();
+
+  // Some current ChatGPT DOM variants expose no stable turn/message id around
+  // the action row. Using the visible assistant-row index as identity is wrong:
+  // virtualization can keep exactly N mounted rows, so a brand-new answer can
+  // reuse the same final index as the previous answer. That made the ready
+  // detector think "nothing new happened".
+  const syntheticRowIds = new WeakMap();
+  let nextSyntheticRowId = 1;
+
+  let passiveReadyRoute = location.pathname;
+  let passiveReadyInitialized = false;
+  let passiveReadyBaselineKey = "";
+  let passiveReadyCandidateKey = "";
+  let passiveReadyCandidateSince = 0;
+  let passiveReadyBaselineSince = 0;
+
   // Dictation / silence monitor.
   let lastMicStream = null;
   let silenceSession = null;
   let silenceRestartBlockedUntil = 0;
+  let silenceMonitorStartPromise = null;
+  let silenceMonitorStartStream = null;
 
   // Read-aloud media state.
   let pendingReadKey = "";
@@ -248,20 +271,19 @@
       }
     }
 
-    // ChatGPT can rerender the message body and action controls. The old
-    // implementation keyed a response only by extracted text; when the body
-    // lookup resolved to an older shared ancestor, several different action
-    // rows received the exact same key. resolveEntryByKey() then selected the
-    // first matching old response, producing "random previous message" audio.
-    //
-    // DOM order of assistant action rows is unique even when text extraction
-    // is temporarily ambiguous, and remains stable as new turns append.
-    const rows = [...document.querySelectorAll(ACTION_ROW_SELECTOR)].filter(
-      isAssistantActionRow,
-    );
-    const index = rows.indexOf(row);
+    // No stable ChatGPT turn id is available in this DOM variant.
+    // Give the actual action-row element its own identity instead of using its
+    // list index. A new mounted response therefore always gets a new key even
+    // when ChatGPT virtualizes old messages and keeps the mounted row count
+    // constant.
+    let syntheticId = syntheticRowIds.get(row);
 
-    return index >= 0 ? `assistant-row:${index}` : "";
+    if (!syntheticId) {
+      syntheticId = nextSyntheticRowId++;
+      syntheticRowIds.set(row, syntheticId);
+    }
+
+    return `assistant-row-dom:${syntheticId}`;
   }
 
   function entryForRow(row) {
@@ -474,6 +496,11 @@
       startedAt: performance.now(),
       baselineKey: latest?.key || "",
       baselineKeys: new Set(baselineEntries.map((entry) => entry.key)),
+      baselineRows: new WeakSet(
+        baselineEntries
+          .map((entry) => entry.row)
+          .filter((row) => row instanceof Element),
+      ),
       sawGeneration: generationRunning(),
       generationStoppedAt: 0,
       candidateKey: "",
@@ -718,7 +745,7 @@
       seekResumeTarget(media, target, restoreMuted, restoreVolume);
     }
 
-    if (!media.__chatgptFlowV0523Lifecycle) {
+    if (!media.__chatgptFlowV0526Lifecycle) {
       media.addEventListener(
         "ended",
         () => {
@@ -728,7 +755,7 @@
       );
 
       try {
-        Object.defineProperty(media, "__chatgptFlowV0523Lifecycle", {
+        Object.defineProperty(media, "__chatgptFlowV0526Lifecycle", {
           value: true,
           configurable: true,
         });
@@ -1286,10 +1313,25 @@
       }, 1000);
     };
 
-    const latest = latestAssistantEntry();
-    if (!latest || latest.key !== key) {
+    let latest = latestAssistantEntry();
+    if (!latest) {
       log("Skipping stale auto-read target");
       return;
+    }
+
+    if (latest.key !== key) {
+      const original = resolveEntryByKey(key);
+      const sameResponseAfterRerender =
+        original?.text &&
+        latest.text &&
+        original.text === latest.text;
+
+      if (!sameResponseAfterRerender) {
+        log("Skipping stale auto-read target");
+        return;
+      }
+
+      key = latest.key;
     }
 
     if (localPlaybackLooksActive() || otherTabPlaybackActive()) {
@@ -1304,8 +1346,19 @@
         return;
       }
 
-      const entry = resolveEntryByKey(key);
+      let entry = resolveEntryByKey(key);
       const currentLatest = latestAssistantEntry();
+
+      if (
+        !entry &&
+        currentLatest &&
+        latest?.text &&
+        currentLatest.text === latest.text
+      ) {
+        entry = currentLatest;
+        key = currentLatest.key;
+      }
+
       if (
         !entry ||
         !currentLatest ||
@@ -1365,9 +1418,30 @@
     }
   }
 
-  function finishResponse(session, entry) {
-    if (responseSession !== session) return;
-    responseSession = null;
+  function markReadyHandled(key) {
+    if (!key) return;
+
+    readyHandledKeys.add(key);
+
+    if (readyHandledKeys.size > 200) {
+      const oldest = readyHandledKeys.values().next().value;
+      if (oldest) readyHandledKeys.delete(oldest);
+    }
+  }
+
+  function handleReadyEntry(entry, source = "tracked") {
+    if (
+      !settings.enabled ||
+      !entry?.key ||
+      readyHandledKeys.has(entry.key)
+    ) {
+      return false;
+    }
+
+    markReadyHandled(entry.key);
+    passiveReadyBaselineKey = entry.key;
+    passiveReadyCandidateKey = "";
+    passiveReadyCandidateSince = 0;
 
     playReadySound();
 
@@ -1385,10 +1459,89 @@
     }
 
     log("Response ready", {
+      source,
       sound: settings.readySoundEnabled,
       autoRead: settings.autoReadEnabled,
       delayMs: settings.autoReadDelayMs,
+      key: entry.key,
     });
+
+    return true;
+  }
+
+  function finishResponse(session, entry) {
+    if (responseSession !== session) return;
+    responseSession = null;
+    handleReadyEntry(entry, "tracked");
+  }
+
+  function pollPassiveReadyState() {
+    if (!settings.enabled) return;
+
+    const now = performance.now();
+
+    if (location.pathname !== passiveReadyRoute) {
+      passiveReadyRoute = location.pathname;
+      passiveReadyInitialized = false;
+      passiveReadyBaselineKey = "";
+      passiveReadyCandidateKey = "";
+      passiveReadyCandidateSince = 0;
+      passiveReadyBaselineSince = 0;
+      return;
+    }
+
+    const latest = latestAssistantEntry();
+    if (!latest) return;
+
+    // Initial hydration can add historical action rows one by one. Establish
+    // a quiet baseline first so opening/reloading an existing conversation
+    // never produces a fake "new response" sound.
+    if (!passiveReadyInitialized) {
+      if (latest.key !== passiveReadyBaselineKey) {
+        passiveReadyBaselineKey = latest.key;
+        passiveReadyBaselineSince = now;
+        return;
+      }
+
+      if (!passiveReadyBaselineSince) {
+        passiveReadyBaselineSince = now;
+        return;
+      }
+
+      if (now - passiveReadyBaselineSince < 1500) return;
+
+      passiveReadyInitialized = true;
+      assistantEntries().forEach((entry) => markReadyHandled(entry.key));
+      return;
+    }
+
+    // The explicit response tracker is more precise whenever it is armed.
+    // The passive watcher is only a safety net for submissions we did not see.
+    if (responseSession || generationRunning()) {
+      passiveReadyCandidateKey = "";
+      passiveReadyCandidateSince = 0;
+      return;
+    }
+
+    if (
+      latest.key === passiveReadyBaselineKey ||
+      readyHandledKeys.has(latest.key)
+    ) {
+      passiveReadyBaselineKey = latest.key;
+      passiveReadyCandidateKey = "";
+      passiveReadyCandidateSince = 0;
+      return;
+    }
+
+    if (latest.key !== passiveReadyCandidateKey) {
+      passiveReadyCandidateKey = latest.key;
+      passiveReadyCandidateSince = now;
+      return;
+    }
+
+    if (now - passiveReadyCandidateSince < 700) return;
+
+    handleReadyEntry(latest, "passive");
   }
 
   function pollResponseState() {
@@ -1425,8 +1578,14 @@
     // assistant turn. That is a stronger completion signal than the Stop
     // button, which can be missed entirely for short/background responses.
     const isNewEntry =
-      latest.key !== session.baselineKey &&
-      !session.baselineKeys?.has?.(latest.key);
+      (
+        latest.key !== session.baselineKey &&
+        !session.baselineKeys?.has?.(latest.key)
+      ) ||
+      (
+        latest.row instanceof Element &&
+        !session.baselineRows?.has?.(latest.row)
+      );
 
     if (!isNewEntry) return;
 
@@ -1486,7 +1645,7 @@
     return Math.sqrt(sum / buffer.length);
   }
 
-  async function startSilenceMonitor(stream) {
+  async function startSilenceMonitorImpl(stream) {
     if (
       !settings.enabled ||
       !settings.autoSendEnabled ||
@@ -1542,9 +1701,11 @@
       speechConfirmed: false,
       speechEvidenceMs: 0,
       peakRms: 0,
+      startedAt: performance.now(),
       lastSampleAt: performance.now(),
       lastSpeechAt: 0,
       quietSince: 0,
+      unconfirmedQuietSince: 0,
       sending: false,
     };
 
@@ -1586,11 +1747,16 @@
 
         if (voice) {
           session.speechEvidenceMs += delta;
+          session.unconfirmedQuietSince = 0;
         } else {
           session.speechEvidenceMs = Math.max(
             0,
             session.speechEvidenceMs - delta * 0.35,
           );
+
+          if (!session.unconfirmedQuietSince) {
+            session.unconfirmedQuietSince = now;
+          }
 
           if (level < Math.max(0.008, startThreshold * 1.4)) {
             session.noiseFloor =
@@ -1605,10 +1771,32 @@
           session.speechConfirmed = true;
           session.lastSpeechAt = now;
           session.quietSince = 0;
+          session.unconfirmedQuietSince = 0;
           log("Speech detected");
+          return;
         }
 
-        return;
+        const fallbackSilenceMs = Math.max(
+          2000,
+          Math.min(90000, Number(settings.silenceMs) || 5000),
+        );
+
+        // Fallback only when native dictation is definitely active and the
+        // analyser has observed uninterrupted quiet for the user's configured
+        // timeout. This prevents a missed very-early utterance from leaving the
+        // first dictation session stuck forever.
+        if (
+          session.unconfirmedQuietSince &&
+          now - session.unconfirmedQuietSince >= fallbackSilenceMs &&
+          isUsableButton(findTranscribeAndSendButton())
+        ) {
+          session.speechConfirmed = true;
+          session.lastSpeechAt = session.unconfirmedQuietSince;
+          session.quietSince = session.unconfirmedQuietSince;
+          log("Recovering missed early speech from dictation silence");
+        } else {
+          return;
+        }
       }
 
       // After speech is confirmed, use a noticeably stronger threshold than
@@ -1669,6 +1857,27 @@
     log("Silence monitor attached");
   }
 
+  function startSilenceMonitor(stream) {
+    if (
+      silenceMonitorStartPromise &&
+      silenceMonitorStartStream === stream
+    ) {
+      return silenceMonitorStartPromise;
+    }
+
+    const task = startSilenceMonitorImpl(stream);
+    silenceMonitorStartStream = stream;
+    silenceMonitorStartPromise = task;
+
+    task.finally(() => {
+      if (silenceMonitorStartPromise !== task) return;
+      silenceMonitorStartPromise = null;
+      silenceMonitorStartStream = null;
+    });
+
+    return task;
+  }
+
   function restartSilenceMonitorIfPossible() {
     if (
       performance.now() >= silenceRestartBlockedUntil &&
@@ -1690,9 +1899,11 @@
         lastMicStream = stream;
 
         if (settings.enabled && settings.autoSendEnabled) {
-          startSilenceMonitor(stream).catch((error) =>
-            log("Could not attach silence monitor:", error),
-          );
+          try {
+            await startSilenceMonitor(stream);
+          } catch (error) {
+            log("Could not attach silence monitor:", error);
+          }
         }
       }
 
@@ -1705,6 +1916,7 @@
       !settings.enabled ||
       !settings.autoSendEnabled ||
       silenceSession ||
+      silenceMonitorStartPromise ||
       performance.now() < silenceRestartBlockedUntil ||
       !streamHasLiveAudio(lastMicStream) ||
       !findTranscribeAndSendButton()
@@ -1862,6 +2074,8 @@
 
     if (!settings.enabled) {
       responseSession = null;
+      passiveReadyCandidateKey = "";
+      passiveReadyCandidateSince = 0;
       clearPendingAutoRead();
       clearSilenceSession();
       disarmMediaCapture();
@@ -1884,6 +2098,7 @@
 
   const mutationObserver = new MutationObserver(() => {
     pollResponseState();
+    pollPassiveReadyState();
     ensureSilenceMonitorForActiveDictation();
   });
 
@@ -1894,6 +2109,7 @@
 
   responsePollTimer = window.setInterval(() => {
     pollResponseState();
+    pollPassiveReadyState();
     ensureSilenceMonitorForActiveDictation();
   }, 250);
 
@@ -1948,5 +2164,5 @@
     "*",
   );
 
-  log("v0.5.23 cross-tab takeover + sound retry loaded");
+  log("v0.5.26 first-dictation auto-send race fix loaded");
 })();

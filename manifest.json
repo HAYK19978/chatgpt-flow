@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Flow",
-  "version": "0.5.23",
-  "description": "Hands-free ChatGPT workflow with single-audio manual takeover across tabs, reliable ready sound, stable per-turn playback targeting and live popup settings.",
+  "version": "0.5.26",
+  "description": "Hands-free ChatGPT workflow with first-dictation-safe silence auto-send, virtualization-safe ready detection, live settings and stable cross-tab playback.",
   "permissions": [
     "storage",
     "offscreen"

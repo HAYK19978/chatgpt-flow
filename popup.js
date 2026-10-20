@@ -95,15 +95,29 @@
       playbackRate: clampRate(rate.value),
     };
 
-    // Important: dispatch storage.set immediately. The previous implementation
-    // awaited storage.get() first; closing the popup during that await could
-    // terminate the popup before the actual write, leaving page settings stale
-    // until a reload.
-    chrome.storage.local
-      .set({ [KEY]: currentSettings })
-      .catch((error) =>
-        console.log("[ChatGPT Flow] Could not save popup settings:", error),
-      );
+    // Hand the write to the service worker immediately. The service worker
+    // survives the popup closing and chrome.storage.onChanged then pushes the
+    // new settings into every open ChatGPT tab without a page reload.
+    chrome.runtime
+      .sendMessage({
+        type: "chatgpt-flow-update-settings",
+        settings: currentSettings,
+      })
+      .catch((error) => {
+        console.log(
+          "[ChatGPT Flow] Background settings save failed; using direct fallback:",
+          error,
+        );
+
+        chrome.storage.local
+          .set({ [KEY]: currentSettings })
+          .catch((fallbackError) =>
+            console.log(
+              "[ChatGPT Flow] Direct settings fallback failed:",
+              fallbackError,
+            ),
+          );
+      });
 
     render();
   }
