@@ -1,8 +1,8 @@
 (() => {
   "use strict";
 
-  if (window.__CHATGPT_FLOW_CONTROLLER_V0526__) return;
-  window.__CHATGPT_FLOW_CONTROLLER_V0526__ = true;
+  if (window.__CHATGPT_FLOW_CONTROLLER_V0527__) return;
+  window.__CHATGPT_FLOW_CONTROLLER_V0527__ = true;
 
   const READ_SELECTOR = 'button[aria-label="Read aloud"]';
   const TRANSCRIBE_SELECTOR = 'button[aria-label="Transcribe and send"]';
@@ -93,6 +93,7 @@
   // We never keep a global play() guard while paused, because that poisoned
   // subsequent native Read aloud attempts.
   let resumeSeekTarget = null;
+  let resumeRestoring = false;
 
   // nativeButtonClick.call(Stop reading aloud) dispatches a normal click event.
   // Without this flag, our document listener mistakes Flow's own Pause for a
@@ -440,6 +441,11 @@
       if (data.state === "takeover") {
         remotePlayback.set(data.tabId, Number(data.at) || Date.now());
 
+        if (resumeRestoring && virtualPaused) {
+          abortResumeRestore(activeMedia, "cross-tab takeover");
+          return;
+        }
+
         if (virtualPaused || !localPlaybackLooksActive()) return;
 
         // Manual playback in another tab wins. Prefer Flow Pause so this tab
@@ -549,6 +555,7 @@
     virtualPauseOriginalMuted = false;
     virtualPauseOriginalVolume = 1;
     resumeSeekTarget = null;
+    resumeRestoring = false;
   }
 
   function dispatchPlaybackState() {
@@ -649,13 +656,76 @@
     releaseAutoReadLock();
   }
 
-  function seekResumeTarget(media, target, restoreMuted, restoreVolume) {
-    const deadline = performance.now() + 10000;
+  function abortResumeRestore(media = activeMedia, reason = "resume restore failed") {
+    const target = Math.max(
+      0,
+      Number.isFinite(resumeSeekTarget)
+        ? Number(resumeSeekTarget)
+        : Number(virtualPausePosition) || 0,
+    );
 
-    const finish = () => {
+    disarmMediaCapture();
+
+    const row =
+      (activeReadRow instanceof Element && activeReadRow.isConnected
+        ? activeReadRow
+        : resolveEntryByKey(activeReadKey)?.row) || null;
+    const control = nativeReadButton(row);
+
+    try {
+      if (
+        isUsableButton(control) &&
+        /^Stop reading aloud$/i.test(buttonLabel(control))
+      ) {
+        flowInitiatedNativeStop = true;
+        nativeButtonClick.call(control);
+      } else if (
+        media instanceof HTMLMediaElement &&
+        !media.paused
+      ) {
+        nativeMediaPause.call(media);
+      }
+    } catch {}
+
+    if (activeMedia === media) {
+      activeMedia = null;
+    }
+
+    if (activeMediaStartTimer) {
+      clearTimeout(activeMediaStartTimer);
+      activeMediaStartTimer = 0;
+    }
+
+    activeMediaStartingUntil = 0;
+    pendingReadKey = "";
+    pendingReadRow = null;
+    resumeSeekTarget = null;
+    resumeRestoring = false;
+
+    // Preserve the original response + saved position. A failed restore must
+    // remain a real Pause, never silently degrade into replay from zero.
+    virtualPaused = true;
+    virtualPausePosition = target;
+
+    stopPlaybackHeartbeat();
+    dispatchPlaybackState();
+
+    queueMicrotask(() => {
+      flowInitiatedNativeStop = false;
+    });
+
+    log("Resume restore aborted:", reason, `position=${target.toFixed(2)}`);
+  }
+
+  function seekResumeTarget(media, target, restoreMuted, restoreVolume) {
+    const deadline = performance.now() + 8000;
+    const tolerance = 0.12;
+
+    const succeed = () => {
       if (activeMedia !== media) return;
 
       try {
+        media.currentTime = Math.max(0, target);
         media.defaultPlaybackRate = settings.playbackRate;
         media.playbackRate = settings.playbackRate;
         media.muted = restoreMuted;
@@ -663,10 +733,12 @@
       } catch {}
 
       resumeSeekTarget = null;
+      resumeRestoring = false;
       virtualPaused = false;
       virtualPausePosition = 0;
       virtualPauseOriginalMuted = false;
       virtualPauseOriginalVolume = 1;
+      startPlaybackHeartbeat();
       dispatchPlaybackState();
     };
 
@@ -674,37 +746,70 @@
       if (activeMedia !== media) return;
 
       try {
-        let canSeek = false;
+        const current = Number(media.currentTime || 0);
 
-        if (media.seekable?.length) {
-          const start = media.seekable.start(0);
-          const end = media.seekable.end(media.seekable.length - 1);
-
-          if (target >= start && target <= end) {
-            media.currentTime = target;
-            canSeek = true;
-          }
-        } else if (Number.isFinite(media.duration) && media.duration > target) {
-          media.currentTime = target;
-          canSeek = true;
-        }
-
-        if (
-          canSeek ||
-          performance.now() >= deadline
-        ) {
-          if (!canSeek) {
-            try {
-              media.currentTime = Math.max(0, target);
-            } catch {}
-          }
-
-          finish();
+        if (current + tolerance >= target) {
+          succeed();
           return;
         }
-      } catch {}
 
-      window.setTimeout(trySeek, 100);
+        let furthest = null;
+
+        if (media.seekable?.length) {
+          const firstStart = media.seekable.start(0);
+          const lastEnd = media.seekable.end(media.seekable.length - 1);
+
+          if (target >= firstStart && target <= lastEnd) {
+            media.currentTime = target;
+            succeed();
+            return;
+          }
+
+          if (lastEnd > firstStart) {
+            furthest = Math.max(firstStart, lastEnd - 0.03);
+          }
+        } else if (
+          Number.isFinite(media.duration) &&
+          media.duration > 0
+        ) {
+          if (media.duration > target) {
+            media.currentTime = target;
+            succeed();
+            return;
+          }
+
+          furthest = Math.max(0, media.duration - 0.03);
+        }
+
+        // While muted, jump as far through already-buffered TTS as Chrome
+        // allows. This avoids spending real-time replaying from zero just to
+        // reach the saved position.
+        if (
+          Number.isFinite(furthest) &&
+          furthest > current + 0.05
+        ) {
+          media.currentTime = Math.min(target, furthest);
+        }
+
+        try {
+          media.playbackRate = Math.max(
+            settings.playbackRate,
+            4,
+          );
+        } catch {}
+
+        if (performance.now() >= deadline) {
+          abortResumeRestore(media, "saved position did not become seekable");
+          return;
+        }
+      } catch (error) {
+        if (performance.now() >= deadline) {
+          abortResumeRestore(media, String(error));
+          return;
+        }
+      }
+
+      window.setTimeout(trySeek, 80);
     };
 
     trySeek();
@@ -745,17 +850,24 @@
       seekResumeTarget(media, target, restoreMuted, restoreVolume);
     }
 
-    if (!media.__chatgptFlowV0526Lifecycle) {
+    if (!media.__chatgptFlowV0527Lifecycle) {
       media.addEventListener(
         "ended",
         () => {
-          if (activeMedia === media) clearActiveMedia(media);
+          if (activeMedia !== media) return;
+
+          if (resumeRestoring && virtualPaused) {
+            abortResumeRestore(media, "resume media ended before restore");
+            return;
+          }
+
+          clearActiveMedia(media);
         },
         { once: true },
       );
 
       try {
-        Object.defineProperty(media, "__chatgptFlowV0526Lifecycle", {
+        Object.defineProperty(media, "__chatgptFlowV0527Lifecycle", {
           value: true,
           configurable: true,
         });
@@ -814,7 +926,12 @@
           (error) => {
             if (activeMedia === media) {
               log("Read aloud media.play rejected:", error);
-              clearActiveMedia(media);
+
+              if (resumeRestoring && virtualPaused) {
+                abortResumeRestore(media, "media.play rejected");
+              } else {
+                clearActiveMedia(media);
+              }
             }
           },
         );
@@ -850,6 +967,16 @@
       // If ChatGPT never produced/captured media and its own button is back at
       // Read aloud, startup failed or already ended. Forget the pending start
       // instead of leaving our custom button stuck on Pause forever.
+      if (
+        resumeRestoring &&
+        virtualPaused &&
+        pendingReadKey &&
+        !activeMedia
+      ) {
+        abortResumeRestore(null, "no resume media was captured");
+        return;
+      }
+
       if (
         pendingReadKey &&
         !mediaActuallyPlaying(activeMedia) &&
@@ -961,6 +1088,7 @@
 
     virtualPaused = true;
     resumeSeekTarget = null;
+    resumeRestoring = false;
 
     // Critical: no HTMLMediaElement.prototype.play guard and no direct
     // media.pause(). Let ChatGPT tear down its own stream cleanly.
@@ -992,6 +1120,7 @@
 
   function resumeVirtualPause() {
     if (!virtualPaused || !activeReadKey) return false;
+    if (resumeRestoring) return true;
 
     const entry = resolveEntryByKey(activeReadKey);
     if (
@@ -1003,19 +1132,22 @@
     }
 
     resumeSeekTarget = Math.max(0, Number(virtualPausePosition) || 0);
+    resumeRestoring = true;
     activeReadRow = entry.row;
 
     armMediaCapture(entry.key, entry.row);
-    startPlaybackHeartbeat();
 
     try {
       nativeButtonClick.call(entry.read);
-      virtualPaused = false;
+
+      // Deliberately keep virtualPaused=true. The UI must not claim playback
+      // resumed until adoptReadMedia() restores the saved position and unmutes.
       dispatchPlaybackState();
       return true;
     } catch (error) {
       disarmMediaCapture();
       resumeSeekTarget = null;
+      resumeRestoring = false;
       virtualPaused = true;
       stopPlaybackHeartbeat();
       log("Resume failed:", error);
@@ -1983,6 +2115,7 @@
           virtualPaused = false;
           virtualPausePosition = 0;
           resumeSeekTarget = null;
+          resumeRestoring = false;
           stopPlaybackHeartbeat();
           releaseAutoReadLock();
           dispatchPlaybackState();
@@ -2164,5 +2297,5 @@
     "*",
   );
 
-  log("v0.5.26 first-dictation auto-send race fix loaded");
+  log("v0.5.27 resume position restore fix loaded");
 })();
