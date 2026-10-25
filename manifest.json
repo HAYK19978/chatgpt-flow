@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Flow",
-  "version": "0.5.27",
+  "version": "0.5.38",
   "description": "Hands-free ChatGPT workflow with reliable pause/resume position restore, first-dictation-safe auto-send, ready notifications and cross-tab playback.",
   "permissions": [
     "storage",

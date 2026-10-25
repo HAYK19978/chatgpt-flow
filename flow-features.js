@@ -1,8 +1,8 @@
 (() => {
   "use strict";
 
-  if (window.__CHATGPT_FLOW_CONTROLLER_V0527__) return;
-  window.__CHATGPT_FLOW_CONTROLLER_V0527__ = true;
+  if (window.__CHATGPT_FLOW_CONTROLLER_V0538__) return;
+  window.__CHATGPT_FLOW_CONTROLLER_V0538__ = true;
 
   const READ_SELECTOR = 'button[aria-label="Read aloud"]';
   const TRANSCRIBE_SELECTOR = 'button[aria-label="Transcribe and send"]';
@@ -16,6 +16,8 @@
   const PLAYBACK_CHANNEL = "chatgpt-flow-playback-v0518";
   const PLAYBACK_OWNER_KEY = "chatgpt-flow-playback-owner";
   const PLAYBACK_OWNER_TTL_MS = 8000;
+  const PLAYBACK_PROGRESS_STALL_MS = 12000;
+  const PLAYBACK_NO_MEDIA_GRACE_MS = 12000;
   const TAB_ID = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
 
   // The UI intentionally still says 15. ChatGPT's streamed TTS timeline has
@@ -52,6 +54,31 @@
   // rerenders, background tabs), so a completed new assistant action row is
   // also watched as a fallback completion signal.
   const readyHandledKeys = new Set();
+  const readyHandledReasons = new Map();
+
+  // Stress diagnostics are deliberately passive: they expose what actually
+  // happened without changing normal behavior.
+  let responseArmCount = 0;
+  let lastResponseArmAt = 0;
+  let lastResponseArmRoute = "";
+  let lastReadyKey = "";
+  let lastReadySource = "";
+  let lastReadyAt = 0;
+  let lastReadyMarkReason = "";
+  let autoReadConfirmedCount = 0;
+  let autoReadFailedStartCount = 0;
+  let lastAutoReadConfirmedKey = "";
+  let lastAutoReadConfirmedAt = 0;
+
+  // Explicit send-arm fallback. This survives SPA route changes and a lost
+  // responseSession so the first answer in a brand-new chat can never be
+  // mistaken for historical hydration.
+  let liveResponseArmPending = false;
+  let liveResponseArmAt = 0;
+  let liveResponseBaselineCount = 0;
+  let liveResponseBaselineRows = new WeakSet();
+  let liveResponseCandidateKey = "";
+  let liveResponseCandidateSince = 0;
 
   // Some current ChatGPT DOM variants expose no stable turn/message id around
   // the action row. Using the visible assistant-row index as identity is wrong:
@@ -80,8 +107,11 @@
   let pendingReadRow = null;
   let activeReadKey = "";
   let activeReadRow = null;
+  let activeReadOrdinal = -1;
+  let activeReadRoute = "";
   let activeMedia = null;
   let virtualPaused = false;
+  let virtualPauseUsesMedia = false;
   let virtualPausePosition = 0;
   let virtualPauseOriginalMuted = false;
   let virtualPauseOriginalVolume = 1;
@@ -124,6 +154,10 @@
   let autoReadSafetyTimer = 0;
   const remotePlayback = new Map();
   let playbackHeartbeatTimer = 0;
+  let playbackHeartbeatStartedAt = 0;
+  let playbackProgressMedia = null;
+  let playbackProgressTime = 0;
+  let playbackProgressAt = 0;
   const playbackChannel =
     typeof BroadcastChannel === "function"
       ? new BroadcastChannel(PLAYBACK_CHANNEL)
@@ -312,6 +346,79 @@
       .filter(Boolean);
   }
 
+  function assistantActionRows() {
+    return [...document.querySelectorAll(ACTION_ROW_SELECTOR)].filter(
+      (row) => isAssistantActionRow(row),
+    );
+  }
+
+  function actionRowOrdinal(row) {
+    if (!(row instanceof Element)) return -1;
+    return assistantActionRows().indexOf(row);
+  }
+
+  function actionRowKey(row) {
+    if (!isAssistantActionRow(row)) return "";
+    const identity = turnIdentity(row);
+    return identity ? `${location.pathname}::${identity}` : "";
+  }
+
+  function rememberActiveRow(row) {
+    if (!(row instanceof Element)) return;
+    activeReadRow = row;
+    activeReadOrdinal = actionRowOrdinal(row);
+    activeReadRoute = location.pathname;
+  }
+
+  function resolveActiveReadRow() {
+    if (activeReadRow instanceof Element && activeReadRow.isConnected) {
+      return activeReadRow;
+    }
+
+    const exact = resolveEntryByKey(activeReadKey)?.row;
+    if (exact instanceof Element) {
+      rememberActiveRow(exact);
+      return exact;
+    }
+
+    if (activeReadOrdinal >= 0 && activeReadRoute === location.pathname) {
+      const candidate = assistantActionRows()[activeReadOrdinal] || null;
+      if (candidate instanceof Element) {
+        activeReadRow = candidate;
+        return candidate;
+      }
+    }
+
+    return null;
+  }
+
+  function maybeRebindActiveRow(row, key) {
+    if (!activeReadKey || !(row instanceof Element) || !key) return false;
+    if (key === activeReadKey) return true;
+
+    if (
+      !activeReadKey.includes("::assistant-row-dom:") ||
+      !key.includes("::assistant-row-dom:") ||
+      activeReadRoute !== location.pathname ||
+      activeReadOrdinal < 0 ||
+      actionRowOrdinal(row) !== activeReadOrdinal
+    ) {
+      return false;
+    }
+
+    const oldKey = activeReadKey;
+    activeReadKey = key;
+    activeReadRow = row;
+
+    if (pendingReadKey === oldKey) pendingReadKey = key;
+    if (transportIntent?.key === oldKey) {
+      transportIntent.key = key;
+      transportIntent.row = row;
+    }
+
+    return true;
+  }
+
   function latestAssistantEntry() {
     return assistantEntries().at(-1) || null;
   }
@@ -458,18 +565,106 @@
     });
   }
 
+  function notePlaybackProgress(media = activeMedia) {
+    if (!(media instanceof HTMLMediaElement)) return;
+
+    const current = Number(media.currentTime || 0);
+    const now = performance.now();
+
+    if (playbackProgressMedia !== media) {
+      playbackProgressMedia = media;
+      playbackProgressTime = current;
+      playbackProgressAt = now;
+      return;
+    }
+
+    if (current > playbackProgressTime + 0.03) {
+      playbackProgressTime = current;
+      playbackProgressAt = now;
+    }
+  }
+
+  function playbackHeartbeatStillLive() {
+    const now = performance.now();
+
+    if (virtualPaused) return false;
+
+    if (activeMedia instanceof HTMLMediaElement && mediaHasSource(activeMedia)) {
+      notePlaybackProgress(activeMedia);
+
+      if (
+        mediaActuallyPlaying(activeMedia) &&
+        now - playbackProgressAt <= PLAYBACK_PROGRESS_STALL_MS
+      ) {
+        return true;
+      }
+
+      // A media element can remain paused=false forever after a broken/stalled
+      // streamed TTS. If its clock no longer advances, it is not allowed to
+      // keep global ownership alive indefinitely.
+      return false;
+    }
+
+    if (capturePendingFor() || nativePlaybackVisible()) {
+      return (
+        now - playbackHeartbeatStartedAt <= PLAYBACK_NO_MEDIA_GRACE_MS
+      );
+    }
+
+    return false;
+  }
+
   function startPlaybackHeartbeat() {
+    const now = performance.now();
+
+    if (!playbackHeartbeatStartedAt) {
+      playbackHeartbeatStartedAt = now;
+    }
+
+    if (activeMedia instanceof HTMLMediaElement) {
+      notePlaybackProgress(activeMedia);
+    }
+
     claimPlaybackOwner();
     announcePlayback("playing");
 
     if (playbackHeartbeatTimer) return;
 
     playbackHeartbeatTimer = window.setInterval(() => {
-      if (localPlaybackLooksActive()) {
+      if (playbackHeartbeatStillLive()) {
         claimPlaybackOwner();
         announcePlayback("playing");
       } else {
+        // A stale/stalled stream must relinquish both local playback state and
+        // global ownership so other ChatGPT tabs can continue automatically.
+        if (
+          activeMedia instanceof HTMLMediaElement &&
+          !virtualPaused
+        ) {
+          try {
+            nativeMediaPause.call(activeMedia);
+          } catch {}
+        }
+
+        clearTransportIntent();
+        disarmMediaCapture();
+        clearPauseGuard();
+
+        activeMedia = null;
+        activeReadKey = "";
+        activeReadRow = null;
+        activeReadOrdinal = -1;
+        activeReadRoute = "";
+        pendingReadKey = "";
+        pendingReadRow = null;
+        resumeSeekTarget = null;
+        resumeRestoring = false;
+        virtualPaused = false;
+        virtualPauseUsesMedia = false;
+
         stopPlaybackHeartbeat();
+        releaseAutoReadLock();
+        dispatchPlaybackState();
       }
     }, 2000);
   }
@@ -479,6 +674,11 @@
       clearInterval(playbackHeartbeatTimer);
       playbackHeartbeatTimer = 0;
     }
+
+    playbackHeartbeatStartedAt = 0;
+    playbackProgressMedia = null;
+    playbackProgressTime = 0;
+    playbackProgressAt = 0;
 
     releasePlaybackOwner();
     announcePlayback("idle");
@@ -490,6 +690,25 @@
     pendingAutoReadTimer = 0;
   }
 
+  function responseRouteCanMigrate(fromRoute, toRoute) {
+    if (fromRoute === toRoute) return true;
+
+    const from = String(fromRoute || "").replace(/\/$/, "") || "/";
+    const to = String(toRoute || "");
+
+    // A brand-new ChatGPT conversation starts on / and is promoted by the
+    // SPA to /c/<id> after the first send. Custom GPT/project entry routes
+    // can similarly gain a /c/<id> suffix. That promotion is still the same
+    // response session and must not cancel ready/auto-read tracking.
+    if (from === "/" && /^\/c\/[^/]+/.test(to)) return true;
+
+    return (
+      !from.includes("/c/") &&
+      to.includes("/c/") &&
+      to.startsWith(`${from}/c/`)
+    );
+  }
+
   function armForResponse() {
     if (!settings.enabled) return;
 
@@ -497,6 +716,32 @@
 
     const baselineEntries = assistantEntries();
     const latest = baselineEntries.at(-1) || null;
+
+    responseArmCount += 1;
+    lastResponseArmAt = performance.now();
+    lastResponseArmRoute = location.pathname;
+
+    liveResponseArmPending = true;
+    liveResponseArmAt = performance.now();
+    liveResponseBaselineCount = baselineEntries.length;
+    liveResponseBaselineRows = new WeakSet(
+      baselineEntries
+        .map((entry) => entry.row)
+        .filter((row) => row instanceof Element),
+    );
+    liveResponseCandidateKey = "";
+    liveResponseCandidateSince = 0;
+
+    // An explicit send means the next completed assistant turn is live, not
+    // historical hydration. Keep the passive watcher armed as a fallback even
+    // if the explicit response tracker later misses a transient SPA signal.
+    passiveReadyRoute = location.pathname;
+    passiveReadyInitialized = true;
+    passiveReadyBaselineKey = latest?.key || "";
+    passiveReadyCandidateKey = "";
+    passiveReadyCandidateSince = 0;
+    passiveReadyBaselineSince = 0;
+
     responseSession = {
       route: location.pathname,
       startedAt: performance.now(),
@@ -551,6 +796,7 @@
     }
 
     virtualPaused = false;
+    virtualPauseUsesMedia = false;
     virtualPausePosition = 0;
     virtualPauseOriginalMuted = false;
     virtualPauseOriginalVolume = 1;
@@ -649,6 +895,9 @@
     activeMedia = null;
     activeReadKey = "";
     activeReadRow = null;
+    activeReadOrdinal = -1;
+    activeReadRoute = "";
+    virtualPauseUsesMedia = false;
     pendingReadKey = "";
     pendingReadRow = null;
     stopPlaybackHeartbeat();
@@ -666,10 +915,7 @@
 
     disarmMediaCapture();
 
-    const row =
-      (activeReadRow instanceof Element && activeReadRow.isConnected
-        ? activeReadRow
-        : resolveEntryByKey(activeReadKey)?.row) || null;
+    const row = resolveActiveReadRow();
     const control = nativeReadButton(row);
 
     try {
@@ -708,6 +954,7 @@
     virtualPausePosition = target;
 
     stopPlaybackHeartbeat();
+    releaseAutoReadLock();
     dispatchPlaybackState();
 
     queueMicrotask(() => {
@@ -825,8 +1072,11 @@
 
     activeMedia = media;
     activeMediaStartingUntil = performance.now() + 3000;
+    playbackProgressMedia = media;
+    playbackProgressTime = Number(media.currentTime || 0);
+    playbackProgressAt = performance.now();
     activeReadKey = key || activeReadKey;
-    activeReadRow = row || activeReadRow;
+    if (row instanceof Element) rememberActiveRow(row);
     pendingReadKey = "";
     pendingReadRow = null;
 
@@ -850,7 +1100,7 @@
       seekResumeTarget(media, target, restoreMuted, restoreVolume);
     }
 
-    if (!media.__chatgptFlowV0527Lifecycle) {
+    if (!media.__chatgptFlowV0538Lifecycle) {
       media.addEventListener(
         "ended",
         () => {
@@ -861,13 +1111,27 @@
             return;
           }
 
+          // Some streamed ChatGPT TTS media are torn down when pause() is
+          // requested. That must not erase the user's saved virtual Pause.
+          // Keep the response identity + saved position and resume later via
+          // ChatGPT's fresh Read aloud stream.
+          if (virtualPaused) {
+            activeMedia = null;
+            activeMediaStartingUntil = 0;
+            virtualPauseUsesMedia = false;
+            stopPlaybackHeartbeat();
+            releaseAutoReadLock();
+            dispatchPlaybackState();
+            return;
+          }
+
           clearActiveMedia(media);
         },
         { once: true },
       );
 
       try {
-        Object.defineProperty(media, "__chatgptFlowV0527Lifecycle", {
+        Object.defineProperty(media, "__chatgptFlowV0538Lifecycle", {
           value: true,
           configurable: true,
         });
@@ -878,6 +1142,8 @@
       activeMediaStartTimer = 0;
       activeMediaStartingUntil = 0;
 
+      // Startup cleanup is forbidden while virtualPaused: pause() can make
+      // media.paused true before ChatGPT has fully settled the original play().
       if (
         activeMedia === media &&
         media.paused &&
@@ -903,7 +1169,7 @@
     pendingReadKey = key || "";
     pendingReadRow = row || null;
     if (key) activeReadKey = key;
-    if (row) activeReadRow = row;
+    if (row instanceof Element) rememberActiveRow(row);
     dispatchPlaybackState();
 
     const previousPlay = HTMLMediaElement.prototype.play;
@@ -919,20 +1185,44 @@
         Promise.resolve(result).then(
           () => {
             if (activeMedia !== media) return;
+
             activeMediaStartingUntil = 0;
+
+            // A user can pause while ChatGPT's original play() promise is
+            // still pending. Its late resolution must never resurrect
+            // playback ownership behind the paused state.
+            if (virtualPaused) {
+              stopPlaybackHeartbeat();
+              releaseAutoReadLock();
+              dispatchPlaybackState();
+              return;
+            }
+
             startPlaybackHeartbeat();
             dispatchPlaybackState();
           },
           (error) => {
-            if (activeMedia === media) {
-              log("Read aloud media.play rejected:", error);
+            if (activeMedia !== media) return;
 
-              if (resumeRestoring && virtualPaused) {
-                abortResumeRestore(media, "media.play rejected");
-              } else {
-                clearActiveMedia(media);
-              }
+            log("Read aloud media.play rejected:", error);
+
+            if (resumeRestoring && virtualPaused) {
+              abortResumeRestore(media, "media.play rejected");
+              return;
             }
+
+            // Calling pause() during media startup can reject the still-pending
+            // play() promise with AbortError. This is a successful Pause, not
+            // a failed playback start. Preserve the virtual paused state.
+            if (virtualPaused) {
+              activeMediaStartingUntil = 0;
+              stopPlaybackHeartbeat();
+              releaseAutoReadLock();
+              dispatchPlaybackState();
+              return;
+            }
+
+            clearActiveMedia(media);
           },
         );
       }
@@ -1004,10 +1294,7 @@
     disarmMediaCapture();
     clearPauseGuard();
 
-    const row =
-      (activeReadRow instanceof Element && activeReadRow.isConnected
-        ? activeReadRow
-        : resolveEntryByKey(activeReadKey)?.row) || null;
+    const row = resolveActiveReadRow();
     const control = nativeReadButton(row);
 
     try {
@@ -1046,7 +1333,6 @@
     }
 
     armMediaCapture(entry.key, entry.row);
-    startPlaybackHeartbeat();
 
     try {
       nativeButtonClick.call(entry.read);
@@ -1068,19 +1354,10 @@
   }
 
   function beginVirtualPause() {
-    const row =
-      (activeReadRow instanceof Element && activeReadRow.isConnected
-        ? activeReadRow
-        : resolveEntryByKey(activeReadKey)?.row) || null;
+    const row = resolveActiveReadRow();
     const control = nativeReadButton(row);
 
-    if (
-      !activeReadKey ||
-      !isUsableButton(control) ||
-      !/^Stop reading aloud$/i.test(buttonLabel(control))
-    ) {
-      return false;
-    }
+    if (!activeReadKey) return false;
 
     virtualPausePosition = mediaHasSource(activeMedia)
       ? Number(activeMedia.currentTime || 0)
@@ -1090,70 +1367,149 @@
     resumeSeekTarget = null;
     resumeRestoring = false;
 
-    // Critical: no HTMLMediaElement.prototype.play guard and no direct
-    // media.pause(). Let ChatGPT tear down its own stream cleanly.
     disarmMediaCapture();
     pendingReadKey = "";
     pendingReadRow = null;
     clearPauseGuard();
 
-    try {
-      flowInitiatedNativeStop = true;
-      nativeButtonClick.call(control);
-      activeMedia = null;
-      stopPlaybackHeartbeat();
-      dispatchPlaybackState();
-      return true;
-    } catch (error) {
-      virtualPaused = false;
-      log("Pause failed:", error);
-      dispatchPlaybackState();
-      return false;
-    } finally {
-      // The click event is dispatched synchronously by HTMLElement.click().
-      // Clear after the native handler + our capture listener have seen it.
-      queueMicrotask(() => {
-        flowInitiatedNativeStop = false;
-      });
+    if (
+      isUsableButton(control) &&
+      /^Stop reading aloud$/i.test(buttonLabel(control))
+    ) {
+      try {
+        virtualPauseUsesMedia = false;
+        flowInitiatedNativeStop = true;
+        nativeButtonClick.call(control);
+        activeMedia = null;
+        stopPlaybackHeartbeat();
+        releaseAutoReadLock();
+        dispatchPlaybackState();
+        return true;
+      } catch (error) {
+        virtualPaused = false;
+        log("Pause failed:", error);
+        dispatchPlaybackState();
+        return false;
+      } finally {
+        queueMicrotask(() => {
+          flowInitiatedNativeStop = false;
+        });
+      }
     }
+
+    if (
+      activeMedia instanceof HTMLMediaElement &&
+      mediaHasSource(activeMedia) &&
+      !activeMedia.paused
+    ) {
+      try {
+        virtualPauseUsesMedia = true;
+        nativeMediaPause.call(activeMedia);
+        stopPlaybackHeartbeat();
+        releaseAutoReadLock();
+        dispatchPlaybackState();
+        return true;
+      } catch (error) {
+        virtualPaused = false;
+        virtualPauseUsesMedia = false;
+        log("Media fallback pause failed:", error);
+        dispatchPlaybackState();
+        return false;
+      }
+    }
+
+    virtualPaused = false;
+    virtualPauseUsesMedia = false;
+    dispatchPlaybackState();
+    return false;
   }
 
-  function resumeVirtualPause() {
+  function resumeVirtualPause({ allowMediaFallback = true } = {}) {
     if (!virtualPaused || !activeReadKey) return false;
     if (resumeRestoring) return true;
 
-    const entry = resolveEntryByKey(activeReadKey);
+    const entry =
+      resolveEntryByKey(activeReadKey) ||
+      (() => {
+        const row = resolveActiveReadRow();
+        return row ? entryForRow(row) : null;
+      })();
+
+    // Preferred resume path: once ChatGPT exposes Read aloud again, restart
+    // through ChatGPT itself and restore the saved position on the new TTS
+    // media. This is much more reliable than reviving a stale streamed media
+    // object that ChatGPT already considers stopped.
     if (
-      !entry ||
-      !isUsableButton(entry.read) ||
-      !/^Read aloud$/i.test(buttonLabel(entry.read))
+      entry &&
+      isUsableButton(entry.read) &&
+      /^Read aloud$/i.test(buttonLabel(entry.read))
     ) {
-      return false;
+      resumeSeekTarget = Math.max(0, Number(virtualPausePosition) || 0);
+      resumeRestoring = true;
+      virtualPauseUsesMedia = false;
+      activeReadRow = entry.row;
+
+      requestPlaybackTakeover();
+      armMediaCapture(entry.key, entry.row);
+
+      try {
+        nativeButtonClick.call(entry.read);
+
+        // Deliberately keep virtualPaused=true. adoptReadMedia() clears it only
+        // after the saved position has been restored and audio is ready.
+        dispatchPlaybackState();
+        return true;
+      } catch (error) {
+        disarmMediaCapture();
+        resumeSeekTarget = null;
+        resumeRestoring = false;
+        virtualPaused = true;
+        stopPlaybackHeartbeat();
+        log("Native resume failed:", error);
+        dispatchPlaybackState();
+        return false;
+      }
     }
 
-    resumeSeekTarget = Math.max(0, Number(virtualPausePosition) || 0);
-    resumeRestoring = true;
-    activeReadRow = entry.row;
+    if (
+      allowMediaFallback &&
+      virtualPauseUsesMedia &&
+      activeMedia instanceof HTMLMediaElement &&
+      mediaHasSource(activeMedia)
+    ) {
+      const media = activeMedia;
 
-    armMediaCapture(entry.key, entry.row);
+      try {
+        media.defaultPlaybackRate = settings.playbackRate;
+        media.playbackRate = settings.playbackRate;
+      } catch {}
 
-    try {
-      nativeButtonClick.call(entry.read);
+      requestPlaybackTakeover();
 
-      // Deliberately keep virtualPaused=true. The UI must not claim playback
-      // resumed until adoptReadMedia() restores the saved position and unmutes.
+      const playResult = nativeMediaPlay.call(media);
+      Promise.resolve(playResult).then(
+        () => {
+          if (activeMedia !== media || !virtualPaused) return;
+          virtualPaused = false;
+          virtualPauseUsesMedia = false;
+          virtualPausePosition = 0;
+          startPlaybackHeartbeat();
+          dispatchPlaybackState();
+        },
+        (error) => {
+          virtualPaused = true;
+          virtualPauseUsesMedia = true;
+          stopPlaybackHeartbeat();
+          log("Media fallback resume failed:", error);
+          dispatchPlaybackState();
+        },
+      );
+
       dispatchPlaybackState();
       return true;
-    } catch (error) {
-      disarmMediaCapture();
-      resumeSeekTarget = null;
-      resumeRestoring = false;
-      virtualPaused = true;
-      stopPlaybackHeartbeat();
-      log("Resume failed:", error);
-      dispatchPlaybackState();
-      return false;
     }
+
+    return false;
   }
 
   function clearTransportIntent() {
@@ -1182,10 +1538,20 @@
           ? intent.row
           : resolveEntryByKey(intent.key)?.row || null;
 
+      const timedOutType = intent.type;
       clearTransportIntent();
 
       if (row) {
         reconcileRowPlayback(row, intent.key);
+      }
+
+      // Give ChatGPT a short grace period to bring back its native Read aloud
+      // control. Only after that grace expires may Resume fall back to directly
+      // reviving the paused media object.
+      if (timedOutType === "resume" && virtualPaused) {
+        const resumed = resumeVirtualPause({ allowMediaFallback: true });
+        dispatchPlaybackState();
+        return resumed;
       }
 
       dispatchPlaybackState();
@@ -1217,7 +1583,7 @@
     ) {
       clearTransportIntent();
       activeReadRow = row;
-      return resumeVirtualPause();
+      return resumeVirtualPause({ allowMediaFallback: false });
     }
 
     scheduleTransportIntent();
@@ -1238,7 +1604,7 @@
   }
 
   function rowKey(row) {
-    return entryForRow(row)?.key || "";
+    return entryForRow(row)?.key || actionRowKey(row);
   }
 
   function reconcileRowPlayback(row, key = rowKey(row)) {
@@ -1277,6 +1643,7 @@
   function rowMatchesActive(row, key = rowKey(row)) {
     if (!key) return false;
 
+    maybeRebindActiveRow(row, key);
     reconcileRowPlayback(row, key);
 
     return (
@@ -1295,6 +1662,7 @@
     const key = rowKey(row);
     if (!key) return false;
 
+    maybeRebindActiveRow(row, key);
     reconcileRowPlayback(row, key);
 
     const sameResponse = !!activeReadKey && activeReadKey === key;
@@ -1420,6 +1788,48 @@
     };
   }
 
+  function readStartupConfirmed(key, row) {
+    const candidateRow =
+      row instanceof Element && row.isConnected
+        ? row
+        : resolveEntryByKey(key)?.row || activeReadRow;
+
+    const nativeLabel = buttonLabel(nativeReadButton(candidateRow));
+
+    return (
+      (
+        activeReadKey === key &&
+        (
+          mediaHasSource(activeMedia) ||
+          mediaActuallyPlaying(activeMedia)
+        )
+      ) ||
+      /^Stop reading aloud$/i.test(nativeLabel)
+    );
+  }
+
+  function waitForReadStartup(key, row, timeoutMs = 10000) {
+    return new Promise((resolve) => {
+      const deadline = performance.now() + timeoutMs;
+
+      const poll = () => {
+        if (readStartupConfirmed(key, row)) {
+          resolve(true);
+          return;
+        }
+
+        if (performance.now() >= deadline) {
+          resolve(false);
+          return;
+        }
+
+        window.setTimeout(poll, 100);
+      };
+
+      poll();
+    });
+  }
+
   async function startAutoReadByKey(key, requestedAt = performance.now()) {
     if (
       !settings.enabled ||
@@ -1467,8 +1877,8 @@
     }
 
     if (localPlaybackLooksActive() || otherTabPlaybackActive()) {
-      markAutoReadHandled(key);
-      log("Auto-read skipped because another message is already playing");
+      log("Auto-read deferred because another message is already playing");
+      retry();
       return;
     }
 
@@ -1503,8 +1913,8 @@
       }
 
       if (localPlaybackLooksActive() || otherTabPlaybackActive()) {
-        markAutoReadHandled(key);
-        log("Auto-read skipped because another message is already playing");
+        log("Auto-read deferred because another message is already playing");
+        retry();
         return;
       }
 
@@ -1526,11 +1936,55 @@
         return;
       }
 
+      // A native button click only means the request was dispatched. In a
+      // background tab ChatGPT can briefly accept the click without actually
+      // starting TTS. Do not permanently mark this response as auto-read until
+      // native playback is observable. Failed starts release the lock and retry.
+      const confirmed = await waitForReadStartup(key, entry.row, 10000);
+
+      if (!confirmed) {
+        autoReadFailedStartCount += 1;
+        log("Auto-read start was not confirmed; retrying", { key });
+        disarmMediaCapture();
+
+        if (pendingReadKey === key) {
+          pendingReadKey = "";
+          pendingReadRow = null;
+        }
+
+        if (
+          activeReadKey === key &&
+          !mediaHasSource(activeMedia) &&
+          !virtualPaused
+        ) {
+          activeReadKey = "";
+          activeReadRow = null;
+        }
+
+        stopPlaybackHeartbeat();
+        releaseAutoReadLock();
+        dispatchPlaybackState();
+        retry();
+        return;
+      }
+
       markAutoReadHandled(key);
+      autoReadConfirmedCount += 1;
+      lastAutoReadConfirmedKey = key;
+      lastAutoReadConfirmedAt = performance.now();
 
       window.setTimeout(() => {
         if (autoReadRelease && !mediaHasSource(activeMedia)) {
-          releaseAutoReadLock();
+          const candidateRow =
+            entry.row instanceof Element && entry.row.isConnected
+              ? entry.row
+              : resolveEntryByKey(key)?.row || activeReadRow;
+
+          if (!/^Stop reading aloud$/i.test(
+            buttonLabel(nativeReadButton(candidateRow)),
+          )) {
+            releaseAutoReadLock();
+          }
         }
       }, 10000);
 
@@ -1550,27 +2004,49 @@
     }
   }
 
-  function markReadyHandled(key) {
+  function markReadyHandled(key, reason = "unknown") {
     if (!key) return;
 
     readyHandledKeys.add(key);
+    readyHandledReasons.set(key, reason);
+    lastReadyMarkReason = reason;
 
     if (readyHandledKeys.size > 200) {
       const oldest = readyHandledKeys.values().next().value;
-      if (oldest) readyHandledKeys.delete(oldest);
+      if (oldest) {
+        readyHandledKeys.delete(oldest);
+        readyHandledReasons.delete(oldest);
+      }
     }
   }
 
   function handleReadyEntry(entry, source = "tracked") {
-    if (
-      !settings.enabled ||
-      !entry?.key ||
-      readyHandledKeys.has(entry.key)
-    ) {
+    if (!settings.enabled || !entry?.key) {
       return false;
     }
 
-    markReadyHandled(entry.key);
+    if (readyHandledKeys.has(entry.key)) {
+      const previousReason = readyHandledReasons.get(entry.key) || "";
+
+      // Historical hydration is allowed to establish a baseline, but it must
+      // never permanently steal a response that the explicit live tracker later
+      // proves belongs to the user's just-submitted prompt.
+      if (source === "tracked" && previousReason === "passive-hydration") {
+        readyHandledKeys.delete(entry.key);
+        readyHandledReasons.delete(entry.key);
+      } else {
+        return false;
+      }
+    }
+
+    markReadyHandled(entry.key, source);
+    liveResponseArmPending = false;
+    liveResponseCandidateKey = "";
+    liveResponseCandidateSince = 0;
+
+    lastReadyKey = entry.key;
+    lastReadySource = source;
+    lastReadyAt = performance.now();
     passiveReadyBaselineKey = entry.key;
     passiveReadyCandidateKey = "";
     passiveReadyCandidateSince = 0;
@@ -1613,17 +2089,74 @@
     const now = performance.now();
 
     if (location.pathname !== passiveReadyRoute) {
-      passiveReadyRoute = location.pathname;
-      passiveReadyInitialized = false;
+      const previousRoute = passiveReadyRoute;
+      const nextRoute = location.pathname;
+      const freshConversationPromotion =
+        responseRouteCanMigrate(previousRoute, nextRoute) &&
+        !String(previousRoute || "").includes("/c/");
+
+      passiveReadyRoute = nextRoute;
       passiveReadyBaselineKey = "";
       passiveReadyCandidateKey = "";
       passiveReadyCandidateSince = 0;
       passiveReadyBaselineSince = 0;
+
+      // A same-document promotion such as / -> /c/<id> is the first live
+      // conversation response, not historical hydration. If the explicit send
+      // tracker missed the submit gesture, keep the passive watcher armed so
+      // the first completed assistant row still gets ready sound + Auto Read.
+      passiveReadyInitialized =
+        freshConversationPromotion || liveResponseArmPending;
+
+      if (!freshConversationPromotion && !liveResponseArmPending) {
+        return;
+      }
+    }
+
+    // When the explicit response tracker is armed, it owns the new response.
+    // This check MUST happen before passive hydration. On the first message of
+    // a brand-new chat, ChatGPT promotes / -> /c/<id>; the passive watcher
+    // resets for that new route. If it hydrates while responseSession is live,
+    // it can incorrectly mark the just-created answer as historical/handled,
+    // suppressing both ready sound and Auto Read.
+    if (responseSession || generationRunning()) {
+      passiveReadyCandidateKey = "";
+      passiveReadyCandidateSince = 0;
       return;
     }
 
     const latest = latestAssistantEntry();
     if (!latest) return;
+
+    if (liveResponseArmPending) {
+      if (now - liveResponseArmAt > 300000) {
+        liveResponseArmPending = false;
+        liveResponseCandidateKey = "";
+        liveResponseCandidateSince = 0;
+      } else {
+        const entries = assistantEntries();
+        const looksLikeArmedResponse =
+          entries.length > liveResponseBaselineCount ||
+          !liveResponseBaselineRows.has(latest.row);
+
+        if (looksLikeArmedResponse) {
+          if (latest.key !== liveResponseCandidateKey) {
+            liveResponseCandidateKey = latest.key;
+            liveResponseCandidateSince = now;
+            return;
+          }
+
+          if (now - liveResponseCandidateSince >= 700) {
+            responseSession = null;
+            handleReadyEntry(latest, "armed-passive");
+            return;
+          }
+        }
+
+        if (!passiveReadyInitialized) passiveReadyInitialized = true;
+        return;
+      }
+    }
 
     // Initial hydration can add historical action rows one by one. Establish
     // a quiet baseline first so opening/reloading an existing conversation
@@ -1643,15 +2176,9 @@
       if (now - passiveReadyBaselineSince < 1500) return;
 
       passiveReadyInitialized = true;
-      assistantEntries().forEach((entry) => markReadyHandled(entry.key));
-      return;
-    }
-
-    // The explicit response tracker is more precise whenever it is armed.
-    // The passive watcher is only a safety net for submissions we did not see.
-    if (responseSession || generationRunning()) {
-      passiveReadyCandidateKey = "";
-      passiveReadyCandidateSince = 0;
+      assistantEntries().forEach((entry) =>
+        markReadyHandled(entry.key, "passive-hydration"),
+      );
       return;
     }
 
@@ -1682,12 +2209,22 @@
 
     const now = performance.now();
 
-    if (
-      location.pathname !== session.route ||
-      now - session.startedAt > 300000
-    ) {
+    if (now - session.startedAt > 300000) {
       responseSession = null;
       return;
+    }
+
+    if (location.pathname !== session.route) {
+      if (!responseRouteCanMigrate(session.route, location.pathname)) {
+        responseSession = null;
+        return;
+      }
+
+      log("Response tracking followed SPA route promotion", {
+        from: session.route,
+        to: location.pathname,
+      });
+      session.route = location.pathname;
     }
 
     const running = generationRunning();
@@ -2065,6 +2602,16 @@
   // User actions / settings / observers
   // ---------------------------------------------------------------------------
 
+  window.addEventListener(
+    "pagehide",
+    () => {
+      clearPendingAutoRead();
+      stopPlaybackHeartbeat();
+      releaseAutoReadLock();
+    },
+    { capture: true },
+  );
+
   document.addEventListener(
     "click",
     (event) => {
@@ -2089,7 +2636,6 @@
           clearPendingAutoRead();
           markAutoReadHandled(entry.key);
           armMediaCapture(entry.key, entry.row);
-          startPlaybackHeartbeat();
         }
         return;
       }
@@ -2207,6 +2753,9 @@
 
     if (!settings.enabled) {
       responseSession = null;
+      liveResponseArmPending = false;
+      liveResponseCandidateKey = "";
+      liveResponseCandidateSince = 0;
       passiveReadyCandidateKey = "";
       passiveReadyCandidateSince = 0;
       clearPendingAutoRead();
@@ -2250,6 +2799,24 @@
     toggle(row) {
       return toggleForRow(row);
     },
+    pauseActive() {
+      return beginVirtualPause();
+    },
+    resumeActive() {
+      if (!virtualPaused || !activeReadKey) return false;
+
+      const row = resolveActiveReadRow();
+      if (row instanceof Element) {
+        requestPlaybackTakeover();
+        return requestTransport("resume", row, activeReadKey);
+      }
+
+      return resumeVirtualPause({ allowMediaFallback: true });
+    },
+    stopActive() {
+      stopCurrentPlayback();
+      return true;
+    },
     start(row) {
       requestPlaybackTakeover();
       return startReadForRow(row);
@@ -2268,6 +2835,79 @@
     },
     state(row) {
       return playbackStateForRow(row);
+    },
+    diagnostics() {
+      const session = responseSession;
+
+      return {
+        route: location.pathname,
+        responseSession: session
+          ? {
+              route: session.route,
+              ageMs: Math.round(performance.now() - session.startedAt),
+              sawGeneration: !!session.sawGeneration,
+              candidateKey: session.candidateKey || "",
+              stableForMs: session.stableSince
+                ? Math.round(performance.now() - session.stableSince)
+                : 0,
+            }
+          : null,
+        pendingAutoReadTimer: !!pendingAutoReadTimer,
+        liveResponseArmPending,
+        liveResponseArmAgeMs: liveResponseArmAt
+          ? Math.round(performance.now() - liveResponseArmAt)
+          : null,
+        liveResponseBaselineCount,
+        liveResponseCandidateKey,
+        responseArmCount,
+        lastResponseArmAgeMs: lastResponseArmAt
+          ? Math.round(performance.now() - lastResponseArmAt)
+          : null,
+        lastResponseArmRoute,
+        readyHandledCount: readyHandledKeys.size,
+        lastReadyKey,
+        lastReadySource,
+        lastReadyMarkReason,
+        lastReadyAgeMs: lastReadyAt
+          ? Math.round(performance.now() - lastReadyAt)
+          : null,
+        autoReadHandledCount: autoReadHandledKeys.size,
+        autoReadConfirmedCount,
+        autoReadFailedStartCount,
+        lastAutoReadConfirmedKey,
+        lastAutoReadConfirmedAgeMs: lastAutoReadConfirmedAt
+          ? Math.round(performance.now() - lastAutoReadConfirmedAt)
+          : null,
+        settings: {
+          enabled: settings.enabled,
+          autoReadEnabled: settings.autoReadEnabled,
+          autoReadDelayMs: settings.autoReadDelayMs,
+          readySoundEnabled: settings.readySoundEnabled,
+          playbackRate: settings.playbackRate,
+        },
+        pendingReadKey,
+        activeReadKey,
+        activeReadOrdinal,
+        activeReadRoute,
+        virtualPauseUsesMedia,
+        hasActiveMedia: mediaHasSource(activeMedia),
+        mediaPlaying: mediaActuallyPlaying(activeMedia),
+        virtualPaused,
+        resumeRestoring,
+        capturePending: capturePendingFor(),
+        autoReadLockHeld: !!autoReadRelease,
+        playbackOwner: readPlaybackOwner(),
+        heartbeatRunning: !!playbackHeartbeatTimer,
+        heartbeatAgeMs: playbackHeartbeatStartedAt
+          ? Math.round(performance.now() - playbackHeartbeatStartedAt)
+          : null,
+        playbackProgressAgeMs: playbackProgressAt
+          ? Math.round(performance.now() - playbackProgressAt)
+          : null,
+        playbackProgressTime,
+        nativePlaybackVisible: nativePlaybackVisible(),
+        otherTabPlaybackActive: otherTabPlaybackActive(),
+      };
     },
     displayedSeekSeconds: DISPLAYED_SEEK_SECONDS,
     internalSeekSeconds: INTERNAL_SEEK_SECONDS,
@@ -2297,5 +2937,5 @@
     "*",
   );
 
-  log("v0.5.27 resume position restore fix loaded");
+  log("v0.5.30 response-route + auto-read-lock fixes loaded");
 })();

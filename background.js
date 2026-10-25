@@ -61,15 +61,13 @@ async function playReadySoundReliable() {
     console.warn("[ChatGPT Flow] Ready sound first attempt failed:", firstError);
   }
 
-  // A newly-created/stale offscreen document can occasionally miss its first
-  // message. Recreate it once and require an explicit play() acknowledgement.
   await closeOffscreenDocument();
   await ensureOffscreenDocument();
   await new Promise((resolve) => setTimeout(resolve, 80));
   await playReadySoundOnce();
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "chatgpt-flow-update-settings") {
     chrome.storage.local
       .set({ chatgptFlowSettings: message.settings || {} })
@@ -81,6 +79,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     return true;
   }
+
 
   if (message?.type !== "chatgpt-flow-play-ready-sound") return;
 
