@@ -32,6 +32,52 @@
 
   let settings = { ...DEFAULT_SETTINGS };
 
+
+  function extensionContextAlive() {
+    try {
+      return !!chrome?.runtime?.id;
+    } catch {
+      return false;
+    }
+  }
+
+  function isInvalidatedContextError(error) {
+    return /extension context invalidated/i.test(
+      String(error?.message || error || ""),
+    );
+  }
+
+  function logBridgeError(prefix, error) {
+    if (isInvalidatedContextError(error)) return;
+    console.log(`[ChatGPT Flow] ${prefix}:`, error);
+  }
+
+  function safeStorageSet(value) {
+    if (!extensionContextAlive()) return;
+
+    try {
+      const result = chrome.storage.local.set(value);
+      Promise.resolve(result).catch((error) => {
+        logBridgeError("Could not save settings", error);
+      });
+    } catch (error) {
+      logBridgeError("Could not save settings", error);
+    }
+  }
+
+  function safeRuntimeMessage(message) {
+    if (!extensionContextAlive()) return;
+
+    try {
+      const result = chrome.runtime.sendMessage(message);
+      Promise.resolve(result).catch((error) => {
+        logBridgeError("Could not request ready sound", error);
+      });
+    } catch (error) {
+      logBridgeError("Could not request ready sound", error);
+    }
+  }
+
   function sendSettings() {
     window.postMessage({
       source: "chatgpt-flow-extension",
@@ -41,7 +87,20 @@
   }
 
   async function loadSettings() {
-    const stored = await chrome.storage.local.get({ [SETTINGS_KEY]: DEFAULT_SETTINGS });
+    if (!extensionContextAlive()) return;
+
+    let stored;
+    try {
+      stored = await chrome.storage.local.get({
+        [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      });
+    } catch (error) {
+      logBridgeError("Settings bridge failed", error);
+      return;
+    }
+
+    if (!extensionContextAlive()) return;
+
     settings = normalizeSettings(stored[SETTINGS_KEY]);
     sendSettings();
   }
@@ -56,26 +115,30 @@
 
     if (event.data?.type === "update-settings") {
       settings = normalizeSettings({ ...settings, ...(event.data.settings || {}) });
-      chrome.storage.local.set({ [SETTINGS_KEY]: settings }).catch((error) => {
-        console.log("[ChatGPT Flow] Could not save settings:", error);
-      });
+      safeStorageSet({ [SETTINGS_KEY]: settings });
       return;
     }
 
     if (event.data?.type === "play-ready-sound") {
-      chrome.runtime.sendMessage({ type: "chatgpt-flow-play-ready-sound" }).catch((error) => {
-        console.log("[ChatGPT Flow] Could not request ready sound:", error);
-      });
+      safeRuntimeMessage({ type: "chatgpt-flow-play-ready-sound" });
     }
   });
 
-  chrome.storage.onChanged.addListener((changes, areaName) => {
-    if (areaName !== "local" || !changes[SETTINGS_KEY]) return;
-    settings = normalizeSettings(changes[SETTINGS_KEY].newValue || DEFAULT_SETTINGS);
-    sendSettings();
-  });
+  if (extensionContextAlive()) {
+    try {
+      chrome.storage.onChanged.addListener((changes, areaName) => {
+        if (areaName !== "local" || !changes[SETTINGS_KEY]) return;
+        settings = normalizeSettings(
+          changes[SETTINGS_KEY].newValue || DEFAULT_SETTINGS,
+        );
+        sendSettings();
+      });
+    } catch (error) {
+      logBridgeError("Could not attach storage listener", error);
+    }
+  }
 
   loadSettings().catch((error) => {
-    console.log("[ChatGPT Flow] Settings bridge failed:", error);
+    logBridgeError("Settings bridge failed", error);
   });
 })();

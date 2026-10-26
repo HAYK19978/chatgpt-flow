@@ -1,8 +1,8 @@
 (() => {
   "use strict";
 
-  if (window.__CHATGPT_FLOW_ROW_UI_V0518__) return;
-  window.__CHATGPT_FLOW_ROW_UI_V0518__ = true;
+  if (window.__CHATGPT_FLOW_ROW_UI_V0541__) return;
+  window.__CHATGPT_FLOW_ROW_UI_V0541__ = true;
 
   const ROW_SELECTOR = ".turn-action-controls";
   const CONTROL_ATTR = "data-chatgpt-flow-row-controls";
@@ -307,22 +307,28 @@
       window.__CHATGPT_FLOW_CONTROLLER__?.state?.(row) || {
         active: false,
         paused: false,
+        playing: false,
+        transition: "",
         rate: 1,
       };
 
-    const nextIcon =
-      state.active && !state.paused ? "pause" : "play";
+    const actuallyPlaying =
+      typeof state.playing === "boolean"
+        ? state.playing
+        : state.active && !state.paused;
+
+    const nextIcon = actuallyPlaying ? "pause" : "play";
 
     if (group.toggle.dataset.flowIcon !== nextIcon) {
       group.toggle.dataset.flowIcon = nextIcon;
       group.toggle.replaceChildren(icon(nextIcon));
     }
 
-    const toggleTitle = state.active
-      ? state.paused
+    const toggleTitle = actuallyPlaying
+      ? "Pause Read aloud"
+      : state.paused || state.transition === "resume"
         ? "Resume Read aloud"
-        : "Pause Read aloud"
-      : "Play Read aloud";
+        : "Play Read aloud";
 
     group.toggle.setAttribute("aria-label", toggleTitle);
     group.toggle.title = toggleTitle;

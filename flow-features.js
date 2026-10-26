@@ -1,8 +1,8 @@
 (() => {
   "use strict";
 
-  if (window.__CHATGPT_FLOW_CONTROLLER_V0538__) return;
-  window.__CHATGPT_FLOW_CONTROLLER_V0538__ = true;
+  if (window.__CHATGPT_FLOW_CONTROLLER_V0541__) return;
+  window.__CHATGPT_FLOW_CONTROLLER_V0541__ = true;
 
   const READ_SELECTOR = 'button[aria-label="Read aloud"]';
   const TRANSCRIBE_SELECTOR = 'button[aria-label="Transcribe and send"]';
@@ -1100,7 +1100,7 @@
       seekResumeTarget(media, target, restoreMuted, restoreVolume);
     }
 
-    if (!media.__chatgptFlowV0538Lifecycle) {
+    if (!media.__chatgptFlowV0539Lifecycle) {
       media.addEventListener(
         "ended",
         () => {
@@ -1131,7 +1131,7 @@
       );
 
       try {
-        Object.defineProperty(media, "__chatgptFlowV0538Lifecycle", {
+        Object.defineProperty(media, "__chatgptFlowV0539Lifecycle", {
           value: true,
           configurable: true,
         });
@@ -1359,11 +1359,14 @@
 
     if (!activeReadKey) return false;
 
+    // Save position BEFORE touching ChatGPT's native transport. The native Stop
+    // can immediately tear down/reset the blob media.
     virtualPausePosition = mediaHasSource(activeMedia)
       ? Number(activeMedia.currentTime || 0)
       : virtualPausePosition;
 
     virtualPaused = true;
+    virtualPauseUsesMedia = false;
     resumeSeekTarget = null;
     resumeRestoring = false;
 
@@ -1372,22 +1375,31 @@
     pendingReadRow = null;
     clearPauseGuard();
 
+    // Primary path: keep ChatGPT itself as the transport source of truth.
     if (
       isUsableButton(control) &&
       /^Stop reading aloud$/i.test(buttonLabel(control))
     ) {
       try {
-        virtualPauseUsesMedia = false;
         flowInitiatedNativeStop = true;
         nativeButtonClick.call(control);
+
+        // The old stream is no longer trusted after native Stop.
         activeMedia = null;
+        activeMediaStartingUntil = 0;
+
+        if (activeMediaStartTimer) {
+          clearTimeout(activeMediaStartTimer);
+          activeMediaStartTimer = 0;
+        }
+
         stopPlaybackHeartbeat();
         releaseAutoReadLock();
         dispatchPlaybackState();
         return true;
       } catch (error) {
         virtualPaused = false;
-        log("Pause failed:", error);
+        log("Native pause failed:", error);
         dispatchPlaybackState();
         return false;
       } finally {
@@ -1397,6 +1409,7 @@
       }
     }
 
+    // Emergency fallback only when ChatGPT's native Stop control is missing.
     if (
       activeMedia instanceof HTMLMediaElement &&
       mediaHasSource(activeMedia) &&
@@ -1410,11 +1423,7 @@
         dispatchPlaybackState();
         return true;
       } catch (error) {
-        virtualPaused = false;
-        virtualPauseUsesMedia = false;
-        log("Media fallback pause failed:", error);
-        dispatchPlaybackState();
-        return false;
+        log("Emergency media pause failed:", error);
       }
     }
 
@@ -1435,19 +1444,29 @@
         return row ? entryForRow(row) : null;
       })();
 
-    // Preferred resume path: once ChatGPT exposes Read aloud again, restart
-    // through ChatGPT itself and restore the saved position on the new TTS
-    // media. This is much more reliable than reviving a stale streamed media
-    // object that ChatGPT already considers stopped.
+    // AUTHORITATIVE fast path: once ChatGPT exposes Read aloud, the previous
+    // TTS session is over. Never try to revive an old blob media object here.
     if (
       entry &&
       isUsableButton(entry.read) &&
       /^Read aloud$/i.test(buttonLabel(entry.read))
     ) {
-      resumeSeekTarget = Math.max(0, Number(virtualPausePosition) || 0);
+      const savedPosition =
+        Math.max(0, Number(virtualPausePosition) || 0);
+
+      resumeSeekTarget = savedPosition;
       resumeRestoring = true;
       virtualPauseUsesMedia = false;
       activeReadRow = entry.row;
+
+      // Explicitly discard stale media bookkeeping before starting fresh TTS.
+      activeMedia = null;
+      activeMediaStartingUntil = 0;
+
+      if (activeMediaStartTimer) {
+        clearTimeout(activeMediaStartTimer);
+        activeMediaStartTimer = 0;
+      }
 
       requestPlaybackTakeover();
       armMediaCapture(entry.key, entry.row);
@@ -1455,8 +1474,9 @@
       try {
         nativeButtonClick.call(entry.read);
 
-        // Deliberately keep virtualPaused=true. adoptReadMedia() clears it only
-        // after the saved position has been restored and audio is ready.
+        // Keep virtualPaused=true until the fresh stream reaches the saved
+        // position. Only then will adoptReadMedia()/seekResumeTarget flip the
+        // state to playing and the UI to Pause.
         dispatchPlaybackState();
         return true;
       } catch (error) {
@@ -1471,13 +1491,20 @@
       }
     }
 
-    if (
+    // Fallback only when native Read aloud is temporarily unavailable AND the
+    // old media is demonstrably alive. A mere blob URL is not enough.
+    const mediaResumeViable =
       allowMediaFallback &&
       virtualPauseUsesMedia &&
       activeMedia instanceof HTMLMediaElement &&
-      mediaHasSource(activeMedia)
-    ) {
+      mediaHasSource(activeMedia) &&
+      activeMedia.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+      activeMedia.networkState !== HTMLMediaElement.NETWORK_NO_SOURCE;
+
+    if (mediaResumeViable) {
       const media = activeMedia;
+      const key = activeReadKey;
+      let settled = false;
 
       try {
         media.defaultPlaybackRate = settings.playbackRate;
@@ -1486,10 +1513,44 @@
 
       requestPlaybackTakeover();
 
-      const playResult = nativeMediaPlay.call(media);
+      let playResult;
+      try {
+        playResult = nativeMediaPlay.call(media);
+      } catch (error) {
+        playResult = Promise.reject(error);
+      }
+
+      const failToNative = (reason) => {
+        if (settled) return;
+        settled = true;
+        if (!virtualPaused || activeReadKey !== key) return;
+
+        virtualPauseUsesMedia = false;
+        if (activeMedia === media) activeMedia = null;
+        stopPlaybackHeartbeat();
+        releaseAutoReadLock();
+        log("Media resume unavailable; switching to native recovery:", reason);
+
+        const row = resolveActiveReadRow();
+        if (row instanceof Element && activeReadKey) {
+          requestTransport("resume", row, activeReadKey);
+        } else {
+          dispatchPlaybackState();
+        }
+      };
+
+      window.setTimeout(() => {
+        if (!settled) {
+          failToNative("media.play did not settle");
+        }
+      }, 1500);
+
       Promise.resolve(playResult).then(
         () => {
+          if (settled) return;
+          settled = true;
           if (activeMedia !== media || !virtualPaused) return;
+
           virtualPaused = false;
           virtualPauseUsesMedia = false;
           virtualPausePosition = 0;
@@ -1497,11 +1558,7 @@
           dispatchPlaybackState();
         },
         (error) => {
-          virtualPaused = true;
-          virtualPauseUsesMedia = true;
-          stopPlaybackHeartbeat();
-          log("Media fallback resume failed:", error);
-          dispatchPlaybackState();
+          failToNative(error);
         },
       );
 
@@ -1532,61 +1589,125 @@
     const intent = transportIntent;
     if (!intent) return false;
 
-    if (performance.now() >= intent.deadline) {
-      const row =
-        intent.row instanceof Element && intent.row.isConnected
-          ? intent.row
-          : resolveEntryByKey(intent.key)?.row || null;
+    const row =
+      intent.row instanceof Element && intent.row.isConnected
+        ? intent.row
+        : resolveEntryByKey(intent.key)?.row || resolveActiveReadRow();
 
-      const timedOutType = intent.type;
-      clearTransportIntent();
+    const control = nativeReadButton(row);
+    const currentLabel = buttonLabel(control);
 
-      if (row) {
-        reconcileRowPlayback(row, intent.key);
+    if (intent.type === "pause") {
+      if (virtualPaused) {
+        clearTransportIntent();
+        dispatchPlaybackState();
+        return true;
       }
 
-      // Give ChatGPT a short grace period to bring back its native Read aloud
-      // control. Only after that grace expires may Resume fall back to directly
-      // reviving the paused media object.
-      if (timedOutType === "resume" && virtualPaused) {
-        const resumed = resumeVirtualPause({ allowMediaFallback: true });
+      if (
+        (
+          isUsableButton(control) &&
+          /^Stop reading aloud$/i.test(currentLabel)
+        ) ||
+        mediaActuallyPlaying(activeMedia)
+      ) {
+        clearTransportIntent();
+        if (row instanceof Element) activeReadRow = row;
+        return beginVirtualPause();
+      }
+    }
+
+    if (intent.type === "resume") {
+      if (
+        !virtualPaused &&
+        (
+          mediaActuallyPlaying(activeMedia) ||
+          /^Stop reading aloud$/i.test(currentLabel)
+        )
+      ) {
+        clearTransportIntent();
         dispatchPlaybackState();
-        return resumed;
+        return true;
+      }
+
+      // Native Read aloud is the source of truth. This branch MUST run before
+      // any media fallback, otherwise a dead blob can swallow Resume forever.
+      if (
+        virtualPaused &&
+        isUsableButton(control) &&
+        /^Read aloud$/i.test(currentLabel)
+      ) {
+        clearTransportIntent();
+        if (row instanceof Element) activeReadRow = row;
+        return resumeVirtualPause({ allowMediaFallback: false });
+      }
+
+      // Only a genuinely buffered/live media stream may be resumed directly.
+      if (
+        virtualPaused &&
+        virtualPauseUsesMedia &&
+        activeMedia instanceof HTMLMediaElement &&
+        mediaHasSource(activeMedia) &&
+        activeMedia.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+        activeMedia.networkState !== HTMLMediaElement.NETWORK_NO_SOURCE
+      ) {
+        clearTransportIntent();
+        if (row instanceof Element) activeReadRow = row;
+        return resumeVirtualPause({ allowMediaFallback: true });
+      }
+    }
+
+    if (performance.now() >= intent.deadline) {
+      if (
+        intent.type === "resume" &&
+        virtualPaused &&
+        !intent.recoveryAttempted &&
+        row instanceof Element &&
+        isUsableButton(control) &&
+        /^Stop reading aloud$/i.test(currentLabel)
+      ) {
+        intent.recoveryAttempted = true;
+        intent.deadline = performance.now() + 6000;
+
+        try {
+          flowInitiatedNativeStop = true;
+          nativeButtonClick.call(control);
+        } catch {}
+
+        queueMicrotask(() => {
+          flowInitiatedNativeStop = false;
+        });
+
+        dispatchPlaybackState();
+        scheduleTransportIntent(80);
+        return true;
+      }
+
+      const timedOutType = intent.type;
+
+      if (timedOutType === "resume" && virtualPaused) {
+        const resumed = resumeVirtualPause({
+          allowMediaFallback: true,
+        });
+
+        if (resumed) {
+          clearTransportIntent();
+          dispatchPlaybackState();
+          return true;
+        }
+      }
+
+      clearTransportIntent();
+
+      if (row instanceof Element) {
+        reconcileRowPlayback(row, intent.key);
       }
 
       dispatchPlaybackState();
       return false;
     }
 
-    const row =
-      intent.row instanceof Element && intent.row.isConnected
-        ? intent.row
-        : resolveEntryByKey(intent.key)?.row || null;
-
-    const control = nativeReadButton(row);
-    const currentLabel = buttonLabel(control);
-
-    if (
-      intent.type === "pause" &&
-      isUsableButton(control) &&
-      /^Stop reading aloud$/i.test(currentLabel)
-    ) {
-      clearTransportIntent();
-      activeReadRow = row;
-      return beginVirtualPause();
-    }
-
-    if (
-      intent.type === "resume" &&
-      isUsableButton(control) &&
-      /^Read aloud$/i.test(currentLabel)
-    ) {
-      clearTransportIntent();
-      activeReadRow = row;
-      return resumeVirtualPause({ allowMediaFallback: false });
-    }
-
-    scheduleTransportIntent();
+    scheduleTransportIntent(60);
     return true;
   }
 
@@ -1596,7 +1717,8 @@
       type,
       row,
       key,
-      deadline: performance.now() + 3000,
+      deadline: performance.now() + 8000,
+      recoveryAttempted: false,
     };
     dispatchPlaybackState();
     serviceTransportIntent();
@@ -1780,10 +1902,27 @@
   function playbackStateForRow(row) {
     const key = rowKey(row);
     const matched = rowMatchesActive(row, key);
+    const nativeLabel = buttonLabel(nativeReadButton(row));
+    const paused = matched && virtualPaused;
+    const playing =
+      matched &&
+      !virtualPaused &&
+      (
+        mediaActuallyPlaying(activeMedia) ||
+        capturePendingFor(key) ||
+        /^Stop reading aloud$/i.test(nativeLabel)
+      );
 
     return {
       active: matched,
-      paused: matched && virtualPaused,
+      paused,
+      playing,
+      transition:
+        matched && transportIntent?.key === key
+          ? transportIntent.type
+          : matched && resumeRestoring
+            ? "resume"
+            : "",
       rate: settings.playbackRate,
     };
   }
@@ -2892,8 +3031,37 @@
         virtualPauseUsesMedia,
         hasActiveMedia: mediaHasSource(activeMedia),
         mediaPlaying: mediaActuallyPlaying(activeMedia),
+        activeMediaDetails:
+          activeMedia instanceof HTMLMediaElement
+            ? {
+                paused: !!activeMedia.paused,
+                ended: !!activeMedia.ended,
+                readyState: Number(activeMedia.readyState),
+                networkState: Number(activeMedia.networkState),
+                currentTime: Number(activeMedia.currentTime || 0),
+                duration: Number(activeMedia.duration),
+                currentSrc: String(activeMedia.currentSrc || activeMedia.src || ""),
+                seekable:
+                  activeMedia.seekable?.length
+                    ? {
+                        start: Number(activeMedia.seekable.start(0)),
+                        end: Number(
+                          activeMedia.seekable.end(
+                            activeMedia.seekable.length - 1,
+                          ),
+                        ),
+                      }
+                    : null,
+              }
+            : null,
+        activeNativeLabel: buttonLabel(
+          nativeReadButton(resolveActiveReadRow()),
+        ),
         virtualPaused,
         resumeRestoring,
+        transportIntentType: transportIntent?.type || "",
+        transportIntentRecoveryAttempted:
+          !!transportIntent?.recoveryAttempted,
         capturePending: capturePendingFor(),
         autoReadLockHeld: !!autoReadRelease,
         playbackOwner: readPlaybackOwner(),
@@ -2937,5 +3105,5 @@
     "*",
   );
 
-  log("v0.5.30 response-route + auto-read-lock fixes loaded");
+  log("v0.5.41 native resume recovery loaded");
 })();
